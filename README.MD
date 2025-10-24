@@ -52,65 +52,67 @@ The application is configured via the `config.ini` file:
 
 ## Cross-compiling for Linux (with Docker)
 
-If you need to run the `scanner` on a Linux system with an older GLIBC version (e.g., GLIBC 2.21), you can use Docker to cross-compile the application. This ensures that the binary is built against a compatible `libc`.
+If you need to run the `scanner` and `deleter` on a Linux system, you can use Docker to cross-compile the application. This ensures that the binaries are built in a consistent environment.
 
-1.  **Create a `Dockerfile`:**
-    Save the following content as `Dockerfile` in the root of your project directory:
+1.  **Ensure `Dockerfile` is present:**
+    Make sure the `Dockerfile` in the root of your project directory has the following content:
 
     ```dockerfile
-    # Use an older Debian distribution for an older GLIBC
-    FROM debian:stretch
+    # ===== Stage 1: Builder (glibc 2.17 baseline)
+    FROM quay.io/pypa/manylinux2014_x86_64 AS builder
 
-    # Install necessary packages: git (if needed for go modules), build-essential (for CGO)
-    RUN apt-get update && apt-get install -y \
-        git \
-        build-essential \
-        ca-certificates \
-        wget \
-        && rm -rf /var/lib/apt/lists/*
+    ARG GO_VERSION=1.24.0
+    ENV GOROOT=/usr/local/go \
+        GOPATH=/go \
+        PATH=/usr/local/go/bin:/go/bin:$PATH \
+        CGO_ENABLED=1
 
-    # Install Go 1.24.0
-    ENV GOLANG_VERSION 1.24.0
-    RUN set -eux; \
-        ARCH=; \
-        case "$(dpkg --print-architecture)" in \
-            amd64) ARCH='amd64';; \
-            arm64) ARCH='arm64';; \
-            *) echo "unsupported architecture"; exit 1 ;; \
-        esac; \
-        \
-        wget -O go.tgz "https://golang.org/dl/go${GOLANG_VERSION}.linux-${ARCH}.tar.gz"; \
-        tar -C /usr/local -xzf go.tgz; \
-        rm go.tgz; \
-        \
-        export PATH="/usr/local/go/bin:$PATH"; \
-        go version
+    # Cài toolchain (GCC có sẵn trong manylinux2014), tải Go 1.24.0
+    RUN curl -fsSL https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz -o /tmp/go.tgz \
+     && tar -C /usr/local -xzf /tmp/go.tgz \
+     && rm -f /tmp/go.tgz
 
-    ENV PATH="/usr/local/go/bin:$PATH"
+    WORKDIR /src
+    # copy module files trước để cache deps (tùy repo của bạn)
+    COPY go.mod go.sum ./
+    RUN go env -w GOMODCACHE=/go/pkg/mod && go mod download
 
-    # Set the working directory inside the container
-    WORKDIR /app
-
-    # Copy the Go project files into the container
+    # copy code
     COPY . .
 
-    # Build the application
-    # CGO_ENABLED=1 is crucial here for go-sqlite3
-    # GOOS=linux is implicit since we are in a Linux container
-    # GOARCH will be the container's architecture
-    CMD ["go", "build", "-o", "scanner", "scanner.go"]
+    # Build CGO (liên kết động tới glibc baseline 2.17)
+    # thêm -ldflags "-s -w" để giảm kích thước
+    RUN go build -tags scanner -trimpath -ldflags="-s -w" -o /out/scanner .
+    RUN go build -tags deleter -trimpath -ldflags="-s -w" -o /out/deleter .
+
+    # Kiểm tra các symbol GLIBC yêu cầu (tuỳ chọn)
+    RUN ldd /out/scanner && ldd /out/deleter && (strings -a /out/scanner /out/deleter | grep -o 'GLIBC_[0-9.]*' | sort -u || true)
+
+    # ===== Stage 2: Artifact (xuất binary)
+    FROM scratch AS artifact
+    COPY --from=builder /out/scanner /scanner
+    COPY --from=builder /out/deleter /deleter
     ```
 
 2.  **Build the Docker image:**
     Open your terminal in the project root and run:
     ```bash
-    docker build -t scandir-builder .
+    docker build -t go-scan-app .
     ```
 
-3.  **Run the Docker container to compile:**
-    This command will compile the `scanner` executable and place it in your project directory on the host machine.
+3.  **Extract the binaries from the Docker image:**
+    First, create a temporary container from the image:
     ```bash
-    docker run --rm -v "${PWD}:/app" scandir-builder
+    docker create --name go-scan-app-temp go-scan-app
+    ```
+    Then, copy the `scanner` and `deleter` binaries to your host machine:
+    ```bash
+    docker cp go-scan-app-temp:/scanner ./scanner
+    docker cp go-scan-app-temp:/deleter ./deleter
+    ```
+    Finally, remove the temporary container:
+    ```bash
+    docker rm go-scan-app-temp
     ```
 
-After these steps, you will find the `scanner` executable in your project directory, ready to be transferred and run on your target Linux system.
+After these steps, you will find the `scanner` and `deleter` executables in your project directory, ready to be transferred and run on your target Linux system.
