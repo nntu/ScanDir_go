@@ -1,5 +1,5 @@
 // common_types.go
-//go:build scanner || deleter
+//go:build scanner || deleter || reporter
 
 package main
 

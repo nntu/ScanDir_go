@@ -24,11 +24,13 @@ COPY . .
 # thêm -ldflags "-s -w" để giảm kích thước
 RUN go build -tags scanner -trimpath -ldflags="-s -w" -o /out/scanner .
 RUN go build -tags deleter -trimpath -ldflags="-s -w" -o /out/deleter .
+RUN go build -tags reporter -trimpath -ldflags="-s -w" -o /out/reporter .
 
 # Kiểm tra các symbol GLIBC yêu cầu (tuỳ chọn)
-RUN ldd /out/scanner && ldd /out/deleter && (strings -a /out/scanner /out/deleter | grep -o 'GLIBC_[0-9.]*' | sort -u || true)
+RUN ldd /out/scanner && ldd /out/deleter && ldd /out/reporter && (strings -a /out/scanner /out/deleter /out/reporter | grep -o 'GLIBC_[0-9.]*' | sort -u || true)
 
 # ===== Stage 2: Artifact (xuất binary)
 FROM scratch AS artifact
 COPY --from=builder /out/scanner /scanner
 COPY --from=builder /out/deleter /deleter
+COPY --from=builder /out/reporter /reporter
