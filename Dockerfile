@@ -1,41 +1,32 @@
-# Use an older Debian distribution for an older GLIBC
-FROM debian:stretch
+# ===== Stage 1: Builder (glibc 2.17 baseline)
+FROM quay.io/pypa/manylinux2014_x86_64 AS builder
 
-# Install necessary packages: git (if needed for go modules), build-essential (for CGO)
-RUN apt-get update && apt-get install -y \
-    git \
-    build-essential \
-    ca-certificates \
-    wget \
-    && rm -rf /var/lib/apt/lists/*
+ARG GO_VERSION=1.24.0
+ENV GOROOT=/usr/local/go \
+    GOPATH=/go \
+    PATH=/usr/local/go/bin:/go/bin:$PATH \
+    CGO_ENABLED=1
 
-# Install Go 1.24.0
-ENV GOLANG_VERSION 1.24.0
-RUN set -eux; \
-    ARCH=; \
-    case "$(dpkg --print-architecture)" in \
-        amd64) ARCH='amd64';; \
-        arm64) ARCH='arm64';; \
-        *) echo "unsupported architecture"; exit 1 ;; \
-    esac; \
-    \
-    wget -O go.tgz "https://golang.org/dl/go${GOLANG_VERSION}.linux-${ARCH}.tar.gz"; \
-    tar -C /usr/local -xzf go.tgz; \
-    rm go.tgz; \
-    \
-    export PATH="/usr/local/go/bin:$PATH"; \
-    go version
+# Cài toolchain (GCC có sẵn trong manylinux2014), tải Go 1.24.0
+RUN curl -fsSL https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz -o /tmp/go.tgz \
+ && tar -C /usr/local -xzf /tmp/go.tgz \
+ && rm -f /tmp/go.tgz
 
-ENV PATH="/usr/local/go/bin:$PATH"
+WORKDIR /src
+# copy module files trước để cache deps (tùy repo của bạn)
+COPY go.mod go.sum ./
+RUN go env -w GOMODCACHE=/go/pkg/mod && go mod download
 
-# Set the working directory inside the container
-WORKDIR /app
-
-# Copy the Go project files into the container
+# copy code
 COPY . .
 
-# Build the application
-# CGO_ENABLED=1 is crucial here for go-sqlite3
-# GOOS=linux is implicit since we are in a Linux container
-# GOARCH will be the container's architecture
-CMD ["go", "build", "-o", "scanner", "scanner.go"]
+# Build CGO (liên kết động tới glibc baseline 2.17)
+# thêm -ldflags "-s -w" để giảm kích thước
+RUN go build -trimpath -ldflags="-s -w" -o /out/app ./...
+
+# Kiểm tra các symbol GLIBC yêu cầu (tuỳ chọn)
+RUN ldd /out/app && (strings -a /out/app | grep -o 'GLIBC_[0-9.]*' | sort -u || true)
+
+# ===== Stage 2: Artifact (xuất binary)
+FROM scratch AS artifact
+COPY --from=builder /out/app /app

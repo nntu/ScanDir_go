@@ -1,8 +1,13 @@
 module ScanDir
+
 go 1.24.0
 
 require (
-github.com/mattn/go-sqlite3 v1.14.32 // indirect
+	github.com/go-ini/ini v1.67.0
+	github.com/mattn/go-sqlite3 v1.14.32
+)
+
+require (
 	gorm.io/driver/sqlite v1.6.0 // indirect
 	gorm.io/gorm v1.31.0 // indirect
 )
