@@ -20,7 +20,7 @@ build-image:
 # Target để tạo container tạm thời
 create-container:
 	@echo "Creating temporary container $(CONTAINER_NAME)..."
-	docker create --name $(CONTAINER_NAME) $(IMAGE_NAME)
+	docker create --name $(CONTAINER_NAME) $(IMAGE_NAME) $(SCANNER_BIN)
 
 # Target để copy binary scanner
 copy-scanner:
