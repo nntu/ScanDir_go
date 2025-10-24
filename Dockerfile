@@ -22,11 +22,13 @@ COPY . .
 
 # Build CGO (liên kết động tới glibc baseline 2.17)
 # thêm -ldflags "-s -w" để giảm kích thước
-RUN go build -trimpath -ldflags="-s -w" -o /out/app ./...
+RUN go build -tags scanner -trimpath -ldflags="-s -w" -o /out/scanner .
+RUN go build -tags deleter -trimpath -ldflags="-s -w" -o /out/deleter .
 
 # Kiểm tra các symbol GLIBC yêu cầu (tuỳ chọn)
-RUN ldd /out/app && (strings -a /out/app | grep -o 'GLIBC_[0-9.]*' | sort -u || true)
+RUN ldd /out/scanner && ldd /out/deleter && (strings -a /out/scanner /out/deleter | grep -o 'GLIBC_[0-9.]*' | sort -u || true)
 
 # ===== Stage 2: Artifact (xuất binary)
 FROM scratch AS artifact
-COPY --from=builder /out/app /app
+COPY --from=builder /out/scanner /scanner
+COPY --from=builder /out/deleter /deleter
