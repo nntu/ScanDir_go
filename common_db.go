@@ -1,5 +1,5 @@
 // common_db.go
-//go:build scanner || deleter
+//go:build scanner || deleter || reporter
 
 package main
 

@@ -4,6 +4,7 @@
 package main
 
 import (
+	"database/sql"
 	"flag"
 	"fmt"
 	"log"
@@ -13,7 +14,6 @@ import (
 	"strings"
 	"time"
 
-	"database/sql"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/xuri/excelize/v2" // For Excel output
 )
@@ -158,13 +158,18 @@ func generateExcelReport(db *sql.DB, cfg *ReportConfig) error {
 		}
 	}
 
-	// Remove default "Sheet1" if it exists and is empty
-	if f.GetSheetName(0) == "Sheet1" && f.GetSheetVisible("Sheet1") == true {
-		if err := f.DeleteSheet("Sheet1"); err != nil {
-			log.Printf("Warning: Failed to delete default Sheet1: %v", err)
+	// Remove default "Sheet1" if it exists and is visible
+	if f.GetSheetName(0) == "Sheet1" {
+		visible, err := f.GetSheetVisible("Sheet1")
+		if err != nil {
+			log.Printf("Warning: failed to get visibility for Sheet1: %v", err)
+		}
+		if visible {
+			if err := f.DeleteSheet("Sheet1"); err != nil {
+				log.Printf("Warning: Failed to delete default Sheet1: %v", err)
+			}
 		}
 	}
-
 
 	// Save the Excel file
 	if err := f.SaveAs(cfg.OutputPath); err != nil {
@@ -316,21 +321,18 @@ func generateConsoleReport(db *sql.DB, cfg *ReportConfig) error {
 		return fmt.Errorf("failed to get top largest files: %w", err)
 	}
 	for i, file := range topFiles {
-		fmt.Printf("%d. Size: %-10d Path: %s
-", i+1, file.Size, file.Path)
+		fmt.Printf("%d. Size: %-10d Path: %s", i+1, file.Size, file.Path)
 	}
-	fmt.Println("
---- Duplicate Files ---")
+	fmt.Println()
+	fmt.Println("--- Duplicate Files ---")
 	duplicateGroups, err := getDuplicateFiles(db)
 	if err != nil {
 		return fmt.Errorf("failed to get duplicate files: %w", err)
 	}
 	for _, group := range duplicateGroups {
-		fmt.Printf("Hash: %s (Count: %d)
-", group.HashValue, group.Count)
+		fmt.Printf("Hash: %s (Count: %d)", group.HashValue, group.Count)
 		for _, file := range group.Files {
-			fmt.Printf("  - Size: %-10d Path: %s
-", file.Size, file.Path)
+			fmt.Printf("  - Size: %-10d Path: %s", file.Size, file.Path)
 		}
 		fmt.Println()
 	}
