@@ -44,7 +44,7 @@ func openDBSQLite(dbPath string) (*sql.DB, error) {
 	return db, nil
 }
 
-// initDDL (dùng cho scanner)
+// initDDL (dùng cho scanner - Optimized Version)
 func initDDL(ctx context.Context, db *sql.DB) error {
 	stmts := []string{
 		// Bảng Thư mục
@@ -55,11 +55,13 @@ func initDDL(ctx context.Context, db *sql.DB) error {
 		  name TEXT NOT NULL,
 		  st_mtime DATETIME NOT NULL,
 		  loaithumuc TEXT,
-		  
+
 		  FOREIGN KEY (parent_id) REFERENCES fs_folders (id)
 		)`,
 		`CREATE UNIQUE INDEX idx_folder_path ON fs_folders (path);`,
 		`CREATE INDEX idx_folder_parent_id ON fs_folders (parent_id);`,
+		`CREATE INDEX idx_folder_mtime ON fs_folders (st_mtime DESC);`,
+		`CREATE INDEX idx_folder_loaithumuc ON fs_folders (loaithumuc);`,
 
 		// Bảng Files
 		`CREATE TABLE fs_files (
@@ -77,13 +79,29 @@ func initDDL(ctx context.Context, db *sql.DB) error {
 
 		  FOREIGN KEY (folder_id) REFERENCES fs_folders (id)
 		)`,
+		// Basic indexes
 		`CREATE UNIQUE INDEX idx_file_path ON fs_files (path);`,
 		`CREATE INDEX idx_file_size ON fs_files (size) WHERE size > 0;`,
 		`CREATE INDEX idx_file_hash ON fs_files (hash_value) WHERE hash_value IS NOT NULL;`,
+
+		// Optimized performance indexes
+		`CREATE INDEX idx_file_size_hash_null ON fs_files (size) WHERE hash_value IS NULL;`,
+		`CREATE INDEX idx_file_folder_id_size ON fs_files (folder_id, size DESC);`,
+		`CREATE INDEX idx_file_mtime ON fs_files (st_mtime DESC);`,
+		`CREATE INDEX idx_file_hash_size ON fs_files (hash_value, size) WHERE hash_value IS NOT NULL;`,
+		`CREATE INDEX idx_file_dir_path ON fs_files (dir_path);`,
+		`CREATE INDEX idx_file_extension ON fs_files (fileExt) WHERE fileExt IS NOT NULL;`,
+		`CREATE INDEX idx_file_loaithumuc ON fs_files (loaithumuc);`,
+
+		// Composite indexes for common query patterns
+		`CREATE INDEX idx_file_folder_loaithumuc_size ON fs_files (folder_id, loaithumuc, size DESC);`,
+		`CREATE INDEX idx_file_size_mtime ON fs_files (size DESC, st_mtime DESC);`,
+		`CREATE INDEX idx_file_hash_null_size ON fs_files (hash_value IS NULL, size DESC) WHERE hash_value IS NULL;`,
 	}
-	for _, s := range stmts {
+
+	for i, s := range stmts {
 		if _, err := db.ExecContext(ctx, s); err != nil {
-			return err
+			return fmt.Errorf("failed to execute statement %d (%s): %w", i, s, err)
 		}
 	}
 	return nil
