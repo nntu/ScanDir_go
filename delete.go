@@ -17,6 +17,21 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// configureDB configures database connection settings for optimal performance
+func configureDB(db *sql.DB, phase string, workers int) {
+	switch phase {
+	case "delete":
+		// Deletion: Mixed read/write operations
+		db.SetMaxOpenConns(2)
+		db.SetMaxIdleConns(1)
+		db.SetConnMaxLifetime(30 * time.Minute)
+	default:
+		// Default configuration
+		db.SetMaxOpenConns(1)
+		db.SetMaxIdleConns(1)
+	}
+}
+
 // deleteWithOptimizedQueries performs deletion with optimized database queries
 func deleteWithOptimizedQueries(ctx context.Context, db *sql.DB, cleanPath string) (foldersDeleted, filesDeleted int64, err error) {
 	// Prepare LIKE pattern for subdirectory matching

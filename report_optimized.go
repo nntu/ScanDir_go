@@ -1,5 +1,5 @@
 // report_optimized.go
-//go:build reporter
+//go:build reporter_optimized
 
 package main
 
@@ -12,7 +12,6 @@ import (
 	"html/template"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
@@ -20,6 +19,36 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/xuri/excelize/v2"
 )
+
+// openDBSQLite opens a SQLite database with optimized settings
+func openDBSQLite(dbPath string) (*sql.DB, error) {
+	dsn := fmt.Sprintf("file:%s?_journal_mode=WAL&_synchronous=NORMAL", dbPath)
+
+	db, err := sql.Open("sqlite3", dsn)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := db.Exec("PRAGMA busy_timeout = 5000;"); err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(10)
+	return db, nil
+}
+
+// configureDB configures database connection settings for optimal performance
+func configureDB(db *sql.DB, phase string, workers int) {
+	switch phase {
+	case "report":
+		// Reporting: Read-only operations, optimized for complex queries
+		db.SetMaxOpenConns(2)
+		db.SetMaxIdleConns(1)
+		db.SetConnMaxLifetime(10 * time.Minute)
+	default:
+		// Default configuration
+		db.SetMaxOpenConns(1)
+		db.SetMaxIdleConns(1)
+	}
+}
 
 // ReportConfigOptimized holds configuration for optimized report generation
 type ReportConfigOptimized struct {
@@ -45,15 +74,15 @@ type ReportMetrics struct {
 
 // ReportData holds all data needed for report generation
 type ReportData struct {
-	TopFiles     []FileInfo     `json:"topFiles"`
-	Duplicates   []DuplicateGroup `json:"duplicates"`
+	TopFiles     []FileInfoOptimized     `json:"topFiles"`
+	Duplicates   []DuplicateGroupOptimized `json:"duplicates"`
 	Summary      ReportSummary  `json:"summary"`
 	Metrics      ReportMetrics  `json:"metrics"`
 	GeneratedAt  time.Time      `json:"generatedAt"`
 }
 
 // FileInfo represents file information for reports
-type FileInfo struct {
+type FileInfoOptimized struct {
 	ID       int64  `json:"id"`
 	Path     string `json:"path"`
 	Size     int64  `json:"size"`
@@ -63,12 +92,12 @@ type FileInfo struct {
 	ThuMuc   string `json:"thumuc,omitempty"`
 }
 
-// DuplicateGroup represents a group of duplicate files
-type DuplicateGroup struct {
+// DuplicateGroupOptimized represents a group of duplicate files
+type DuplicateGroupOptimized struct {
 	Hash      string     `json:"hash"`
 	Size      int64      `json:"size"`
 	Count     int        `json:"count"`
-	Files     []FileInfo `json:"files"`
+	Files     []FileInfoOptimized `json:"files"`
 	TotalSize int64      `json:"totalSize"`
 }
 
@@ -236,11 +265,11 @@ func (r *OptimizedReporter) collectReportData() (*ReportData, error) {
 }
 
 // getTopLargestFiles retrieves top N largest files with optimized query
-func (r *OptimizedReporter) getTopLargestFiles() ([]FileInfo, error) {
+func (r *OptimizedReporter) getTopLargestFiles() ([]FileInfoOptimized, error) {
 	cacheKey := fmt.Sprintf("top_files_%d", r.config.TopN)
 	if cached, found := r.cache.Get(cacheKey); found {
 		r.metrics.CacheHits++
-		return cached.([]FileInfo), nil
+		return cached.([]FileInfoOptimized), nil
 	}
 
 	query := `
@@ -259,9 +288,9 @@ func (r *OptimizedReporter) getTopLargestFiles() ([]FileInfo, error) {
 
 	r.metrics.QueriesExecuted++
 
-	var files []FileInfo
+	var files []FileInfoOptimized
 	for rows.Next() {
-		var file FileInfo
+		var file FileInfoOptimized
 		var mtime time.Time
 
 		err := rows.Scan(&file.ID, &file.Path, &file.Size, &mtime, &file.LoaiTM, &file.ThuMuc)
@@ -281,11 +310,11 @@ func (r *OptimizedReporter) getTopLargestFiles() ([]FileInfo, error) {
 }
 
 // getDuplicateFiles retrieves duplicate file groups with optimized query
-func (r *OptimizedReporter) getDuplicateFiles() ([]DuplicateGroup, error) {
+func (r *OptimizedReporter) getDuplicateFiles() ([]DuplicateGroupOptimized, error) {
 	cacheKey := "duplicate_files"
 	if cached, found := r.cache.Get(cacheKey); found {
 		r.metrics.CacheHits++
-		return cached.([]DuplicateGroup), nil
+		return cached.([]DuplicateGroupOptimized), nil
 	}
 
 	query := `
@@ -307,9 +336,9 @@ func (r *OptimizedReporter) getDuplicateFiles() ([]DuplicateGroup, error) {
 
 	r.metrics.QueriesExecuted++
 
-	var groups []DuplicateGroup
+	var groups []DuplicateGroupOptimized
 	for rows.Next() {
-		var group DuplicateGroup
+		var group DuplicateGroupOptimized
 		var ids string
 		var count int
 
@@ -339,7 +368,7 @@ func (r *OptimizedReporter) getDuplicateFiles() ([]DuplicateGroup, error) {
 }
 
 // getFilesByIDs retrieves files by comma-separated IDs
-func (r *OptimizedReporter) getFilesByIDs(ids string) ([]FileInfo, error) {
+func (r *OptimizedReporter) getFilesByIDs(ids string) ([]FileInfoOptimized, error) {
 	idList := strings.Split(ids, ",")
 	placeholders := strings.Repeat("?,", len(idList))
 	placeholders = placeholders[:len(placeholders)-1]
@@ -364,9 +393,9 @@ func (r *OptimizedReporter) getFilesByIDs(ids string) ([]FileInfo, error) {
 
 	r.metrics.QueriesExecuted++
 
-	var files []FileInfo
+	var files []FileInfoOptimized
 	for rows.Next() {
-		var file FileInfo
+		var file FileInfoOptimized
 		var mtime time.Time
 
 		err := rows.Scan(&file.ID, &file.Path, &file.Size, &mtime, &file.LoaiTM, &file.ThuMuc)
@@ -484,7 +513,9 @@ func (r *OptimizedReporter) generateExcelReport(data *ReportData) error {
 	}
 
 	// Set default sheet to Summary
-	f.SetActiveSheet(f.GetSheetIndex(sheets["Summary"]))
+	if summaryIndex, err := f.GetSheetIndex(sheets["Summary"]); err == nil && summaryIndex >= 0 {
+		f.SetActiveSheet(summaryIndex)
+	}
 
 	// Save file
 	if err := f.SaveAs(r.config.OutputPath); err != nil {
@@ -530,7 +561,7 @@ func (r *OptimizedReporter) addSummaryToExcel(f *excelize.File, sheetName string
 }
 
 // addTopFilesToExcel adds top largest files to Excel sheet
-func (r *OptimizedReporter) addTopFilesToExcel(f *excelize.File, sheetName string, files []FileInfo) error {
+func (r *OptimizedReporter) addTopFilesToExcel(f *excelize.File, sheetName string, files []FileInfoOptimized) error {
 	headers := []string{"ID", "Path", "Size", "Modified", "Type", "Folder"}
 
 	// Write headers
@@ -561,7 +592,7 @@ func (r *OptimizedReporter) addTopFilesToExcel(f *excelize.File, sheetName strin
 }
 
 // addDuplicatesToExcel adds duplicate file groups to Excel sheet
-func (r *OptimizedReporter) addDuplicatesToExcel(f *excelize.File, sheetName string, duplicates []DuplicateGroup) error {
+func (r *OptimizedReporter) addDuplicatesToExcel(f *excelize.File, sheetName string, duplicates []DuplicateGroupOptimized) error {
 	headers := []string{"Hash", "Size", "Count", "Total Size", "Files"}
 
 	// Write headers
@@ -815,4 +846,42 @@ func configureDBReport(db *sql.DB) {
 	db.Exec("PRAGMA temp_store = MEMORY")
 	db.Exec("PRAGMA mmap_size = 536870912") // 512MB memory map
 	db.Exec("PRAGMA query_only = 1") // Read-only for reporting
+}
+
+// Main function for optimized reporter
+func main() {
+	// Use the existing main functionality but with optimized reporting
+	config := &ReportConfigOptimized{
+		DBFile:           *flag.String("dbfile", "", "Database file path"),
+		OutputPath:       *flag.String("output", "", "Output file path"),
+		Format:          *flag.String("format", "excel", "Report format (excel, html, console, json)"),
+		TopN:            *flag.Int("topn", 100, "Number of top largest files to include"),
+		MinDuplicateSize: *flag.Int64("minsize", 1024, "Minimum file size for duplicates"),
+	}
+
+	flag.Parse()
+
+	if config.DBFile == "" {
+		fmt.Fprintln(os.Stderr, "Error: Database file path required")
+		flag.Usage()
+		os.Exit(1)
+	}
+
+	if config.OutputPath == "" {
+		fmt.Fprintln(os.Stderr, "Error: Output path required")
+		flag.Usage()
+		os.Exit(1)
+	}
+
+	logger := logrus.New()
+	logger.SetLevel(logrus.InfoLevel)
+	logger.SetFormatter(&logrus.TextFormatter{
+		FullTimestamp: true,
+	})
+
+	reporter := NewOptimizedReporter(config)
+	if err := reporter.generateReport(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error generating report: %v\n", err)
+		os.Exit(1)
+	}
 }

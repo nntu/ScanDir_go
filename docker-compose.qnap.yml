@@ -1,0 +1,160 @@
+# =============================================================================
+# DOCKER COMPOSE FOR QNAS - Filesystem Scanner Multi-Architecture Builder
+# =============================================================================
+# Author: Claude Code Assistant
+# Description: Build QNAS-optimized binaries for multiple architectures
+# Usage: docker-compose -f docker-compose.qnap.yml build
+# =============================================================================
+
+version: '3.8'
+
+services:
+  # QNAS x86_64 Builder (Primary - QNAP Intel/AMD based NAS)
+  qnap-amd64-builder:
+    image: qnap-scandir-builder:amd64-${VERSION:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile.qnap
+      platforms:
+        - linux/amd64
+      args:
+        GO_VERSION: ${GO_VERSION:-1.23.3}
+        TARGETARCH: amd64
+        BUILD_DATE: ${BUILD_DATE:-$(date -u +"%Y-%m-%d %H:%M:%S UTC")}
+        BUILD_FLAGS: "-s -w -extldflags '-static-libgcc'"
+        QNAS_LDFLAGS: "-X main.Version=${VERSION:-2.0-qnap} -X main.BuildDate=${BUILD_DATE:-$(date -u +"%Y-%m-%d %H:%M:%S UTC")} -X main.Target=QNAP-AMD64"
+      target: qnap-builder
+      cache_from:
+        - qnap-scandir-builder:amd64-cache
+    cache_from:
+      - qnap-scandir-builder:amd64-cache
+    container_name: qnap-amd64-build
+    volumes:
+      - ./qnap-output:/output
+    environment:
+      - GOOS=linux
+      - GOARCH=amd64
+      - CGO_ENABLED=1
+      - BUILD_TYPE=release
+    networks:
+      - qnap-build
+
+  # QNAS ARM64 Builder (Secondary - QNAP ARM based NAS, if applicable)
+  qnap-arm64-builder:
+    image: qnap-scandir-builder:arm64-${VERSION:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile.qnap
+      platforms:
+        - linux/arm64
+      args:
+        GO_VERSION: ${GO_VERSION:-1.23.3}
+        TARGETARCH: arm64
+        BUILD_DATE: ${BUILD_DATE:-$(date -u +"%Y-%m-%d %H:%M:%S UTC")}
+        BUILD_FLAGS: "-s -w -extldflags '-static-libgcc'"
+        QNAS_LDFLAGS: "-X main.Version=${VERSION:-2.0-qnap} -X main.BuildDate=${BUILD_DATE:-$(date -u +"%Y-%m-%d %H:%M:%S UTC")} -X main.Target=QNAP-ARM64"
+      target: qnap-builder
+      cache_from:
+        - qnap-scandir-builder:arm64-cache
+    cache_from:
+      - qnap-scandir-builder:arm64-cache
+    container_name: qnap-arm64-build
+    volumes:
+      - ./qnap-output:/output
+    environment:
+      - GOOS=linux
+      - GOARCH=arm64
+      - CGO_ENABLED=1
+      - BUILD_TYPE=release
+    networks:
+      - qnap-build
+    profiles:
+      - arm64
+
+  # QNAS Package Creator
+  qnap-packager:
+    image: alpine:3.19
+    depends_on:
+      - qnap-amd64-builder
+    container_name: qnap-package
+    volumes:
+      - ./qnap-output:/source
+      - ./qnap-packages:/packages
+    command: |
+      sh -c "
+        echo '📦 Creating QNAS deployment packages...'
+        mkdir -p /packages/qnap-amd64
+        mkdir -p /packages/qnap-arm64
+
+        # AMD64 Package
+        if [ -d /source/amd64 ]; then
+          echo 'Creating AMD64 package...'
+          mkdir -p /packages/qnap-amd64/bin
+          cp -r /source/amd64/* /packages/qnap-amd64/bin/ 2>/dev/null || true
+          chmod +x /packages/qnap-amd64/bin/* 2>/dev/null || true
+          tar -czf /packages/qnap-scandir-${VERSION:-2.0-qnap}-amd64.tar.gz -C /packages qnap-amd64
+        fi
+
+        # ARM64 Package
+        if [ -d /source/arm64 ]; then
+          echo 'Creating ARM64 package...'
+          mkdir -p /packages/qnap-arm64/bin
+          cp -r /source/arm64/* /packages/qnap-arm64/bin/ 2>/dev/null || true
+          chmod +x /packages/qnap-arm64/bin/* 2>/dev/null || true
+          tar -czf /packages/qnap-scandir-${VERSION:-2.0-qnap}-arm64.tar.gz -C /packages qnap-arm64
+        fi
+
+        echo '✅ Package creation completed!'
+        ls -la /packages/*.tar.gz || echo 'No packages created'
+      "
+    networks:
+      - qnap-build
+
+  # QNAS Testing Container
+  qnap-tester:
+    image: alpine:3.19
+    depends_on:
+      - qnap-packager
+    container_name: qnap-test
+    volumes:
+      - ./qnap-packages:/packages
+      - ./config.ini:/config.ini:ro
+    command: |
+      sh -c "
+        echo '🧪 Testing QNAS binaries...'
+
+        # Test AMD64 if available
+        if [ -f /packages/qnap-scandir-*-amd64.tar.gz ]; then
+          echo 'Testing AMD64 binaries...'
+          tar -xzf /packages/qnap-scandir-*-amd64.tar.gz -C /tmp
+          if [ -f /tmp/qnap-amd64/bin/scanner ]; then
+            /tmp/qnap-amd64/bin/scanner --help && echo '✅ AMD64 scanner OK' || echo '❌ AMD64 scanner failed'
+          fi
+        fi
+
+        # Test ARM64 if available
+        if [ -f /packages/qnap-scandir-*-arm64.tar.gz ]; then
+          echo 'Testing ARM64 binaries...'
+          tar -xzf /packages/qnap-scandir-*-arm64.tar.gz -C /tmp
+          if [ -f /tmp/qnap-arm64/bin/scanner ]; then
+            /tmp/qnap-arm64/bin/scanner --help && echo '✅ ARM64 scanner OK' || echo '❌ ARM64 scanner failed'
+          fi
+        fi
+
+        echo '🏁 Testing completed!'
+      "
+    networks:
+      - qnap-build
+
+networks:
+  qnap-build:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+volumes:
+  qnap-output:
+    driver: local
+  qnap-packages:
+    driver: local

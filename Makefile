@@ -119,3 +119,121 @@ info:
 	@echo "  Module: $(shell head -1 go.mod)"
 	@echo "  Git Commit: $(shell git rev-parse --short HEAD 2>/dev/null || echo 'N/A')"
 	@echo "  Build Time: $(shell date -u '+%Y-%m-%d %H:%M:%S UTC')"
+
+# =============================================================================
+# QNAS BUILD TARGETS
+# =============================================================================
+
+.PHONY: qnap qnap-clean qnap-amd64 qnap-arm64 qnap-compose qnap-test qnap-package
+
+# Build QNAS version (default AMD64)
+qnap: build-local
+	@echo "Building QNAS optimized version..."
+	./build-qnap.sh
+
+# Build QNAS with verbose output
+qnap-verbose:
+	@echo "Building QNAS optimized version (verbose)..."
+	./build-qnap.sh --verbose
+
+# Build QNAS with specific version
+qnap-version:
+	@if [ -z "$(VERSION)" ]; then echo "Usage: make qnap-version VERSION=1.0.0"; exit 1; fi
+	./build-qnap.sh --version $(VERSION)
+
+# Clean QNAS build artifacts
+qnap-clean:
+	@echo "Cleaning QNAS build artifacts..."
+	./build-qnap.sh --clean
+	rm -rf qnap-build qnap-output qnap-packages
+	rm -f qnap-scanner-*.tar.gz
+
+# Build QNAS AMD64 only
+qnap-amd64:
+	@echo "Building QNAS AMD64 binaries..."
+	./build-qnap.sh --verbose
+
+# Build QNAS ARM64 (if supported)
+qnap-arm64:
+	@echo "Building QNAS ARM64 binaries..."
+	./build-qnap-compose.sh --arm64 --clean --verbose
+
+# Build QNAS multi-architecture with Docker Compose
+qnap-compose:
+	@echo "Building QNAS multi-architecture binaries..."
+	./build-qnap-compose.sh --verbose
+
+# Build QNAS all architectures
+qnap-all:
+	@echo "Building QNAS for all architectures..."
+	./build-qnap-compose.sh --arm64 --clean --verbose
+
+# Test QNAS binaries
+qnap-test: qnap
+	@echo "Testing QNAS binaries..."
+	./build-qnap.sh --skip-tests
+	cd qnap-build && ./scanner --help && ./deleter --help && ./reporter --help
+
+# Create QNAS deployment package
+qnap-package: qnap
+	@echo "Creating QNAS deployment package..."
+	./build-qnap.sh --clean --verbose
+
+# Build QNAS and push to registry
+qnap-push:
+	@if [ -z "$(REGISTRY)" ]; then echo "Usage: make qnap-push REGISTRY=your-registry.com"; exit 1; fi
+	./build-qnap.sh --push --registry $(REGISTRY)
+
+# Quick QNAS deployment simulation
+qnap-deploy-test: qnap
+	@echo "Testing QNAS deployment process..."
+	mkdir -p /tmp/qnap-test
+	cp qnap-build/* /tmp/qnap-test/
+	cd /tmp/qnap-test && ls -la
+	@echo "✅ QNAS deployment test completed in /tmp/qnap-test"
+
+# Show QNAS build information
+qnap-info:
+	@echo "QNAS Build Information:"
+	@echo "  Target Platform: QNAP NAS (x86_64/ARM64)"
+	@echo "  Compatible: QTS 4.x+, QuTS hero"
+	@echo "  Build Tools: Docker + Multi-stage builds"
+	@echo "  Output: Static binaries (no dependencies)"
+	@echo ""
+	@echo "Quick Commands:"
+	@echo "  make qnap         - Build QNAS version"
+	@echo "  make qnap-verbose - Verbose build"
+	@echo "  make qnap-test     - Build and test"
+	@echo "  make qnap-clean    - Clean artifacts"
+	@echo "  make qnap-all      - Build all architectures"
+
+# Help for QNAS targets
+help-qnap:
+	@echo "QNAS Build Targets:"
+	@echo ""
+	@echo "Build Commands:"
+	@echo "  qnap              - Build QNAS version (AMD64)"
+	@echo "  qnap-verbose      - Build with verbose output"
+	@echo "  qnap-version      - Build with specific version"
+	@echo "  qnap-amd64        - Build AMD64 only"
+	@echo "  qnap-arm64        - Build ARM64 binaries"
+	@echo "  qnap-compose      - Multi-architecture build"
+	@echo "  qnap-all          - Build all architectures"
+	@echo ""
+	@echo "Testing & Quality:"
+	@echo "  qnap-test         - Build and test binaries"
+	@echo "  qnap-deploy-test  - Test deployment process"
+	@echo ""
+	@echo "Package & Deploy:"
+	@echo "  qnap-package      - Create deployment package"
+	@echo "  qnap-push         - Build and push to registry"
+	@echo ""
+	@echo "Maintenance:"
+	@echo "  qnap-clean        - Clean build artifacts"
+	@echo "  qnap-info         - Show QNAS build info"
+	@echo "  help-qnap         - Show this help"
+	@echo ""
+	@echo "Examples:"
+	@echo "  make qnap VERSION=1.0.0"
+	@echo "  make qnap-push REGISTRY=registry.example.com"
+	@echo "  make qnap-all VERSION=latest"

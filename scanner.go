@@ -15,7 +15,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1082,7 +1081,7 @@ func main() {
 	ready := make(chan bool, 1)
 
 	// Start optimized database writer
-	go dbWriterOptimized(ctx, db, dynamicCfg, rx, ready)
+	go dbWriterOptimized(ctx, db, dynamicCfg.Config, rx, ready)
 
 	<-ready // Wait for database to be ready
 
@@ -1169,7 +1168,7 @@ func main() {
 
 	// --- PHASE 2: HASHING DUPLICATES ---
 	logger.logger.Info("Starting Phase 2: Hashing potential duplicates")
-	runHashingPhaseOptimized(ctx, db, dynamicCfg)
+	runHashingPhaseOptimized(ctx, db, dynamicCfg.Config)
 	// --- END PHASE 2 ---
 
 	// Final performance summary
