@@ -4,12 +4,9 @@
 package main
 
 import (
-	"context"
 	"database/sql"
-	"encoding/json"
 	"flag"
 	"fmt"
-	"html/template"
 	"log"
 	"os"
 	"path/filepath"
@@ -18,7 +15,6 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/sirupsen/logrus"
 	"github.com/xuri/excelize/v2" // For Excel output
 )
 

@@ -14,37 +14,22 @@ Filesystem Scanner phiên bản QNAS được tối ưu hóa đặc biệt cho c
 - **✅ Safe deletion**: Dry-run mode và path validation
 - **✅ Structured logging**: Detailed metrics và performance tracking
 
-## 🏗️ Build Options
+## 🏗️ Build nhanh (khuyến nghị)
 
-### Option 1: Quick Build (Recommended)
+- Yêu cầu: Docker Desktop + buildx (Mac/Win/Linux)
+- Lấy binary + gói tar.gz (amd64) về `./qnap-build`:
 ```bash
-# Build cho QNAP x86_64 (phổ biến nhất)
+# Linux/macOS
 ./build-qnap.sh
 
-# Build với verbose output
-./build-qnap.sh --verbose
+# Windows PowerShell
+.\build-qnap.ps1
 
-# Build version cụ thể
-./build-qnap.sh --version 1.0.0-qnap
+# Thay đổi version/arch nếu cần
+VERSION=2.1.0-qnap PLATFORM=linux/amd64 ./build-qnap.sh
 ```
 
-### Option 2: Multi-Architecture Build
-```bash
-# Build cả x86_64 và ARM64
-./build-qnap-compose.sh --arm64
-
-# Build và push tới registry
-./build-qnap-compose.sh --arm64 --push --registry your-registry.com
-```
-
-### Option 3: Development Build
-```bash
-# Build debug version
-./build-qnap.sh --type debug --verbose
-
-# Build skip tests
-./build-qnap.sh --skip-tests
-```
+> Ghi chú: các file `docker-compose.qnap.yml`, `build-qnap-compose.sh`… vẫn giữ lại để tham khảo nhưng đã coi là legacy.
 
 ## 📦 Các file được tạo
 

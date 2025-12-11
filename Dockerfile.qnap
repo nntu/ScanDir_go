@@ -1,326 +1,73 @@
-# =============================================================================
-# DOCKERFILE QNAS OPTIMIZED - Filesystem Scanner for QNAP NAS Systems
-# =============================================================================
-# Target: QNAP NAS (x86_64) with Alpine Linux for maximum compatibility
-# Author: Optimized for QNAP QuTS hero and QTS 4.x+
-# Build Date: Multi-stage build for maximum security and minimal size
-# =============================================================================
-
-# ===== Stage 1: QNAS-Optimized Builder (Alpine-based) =====
-# Use Alpine Linux for better QNAP compatibility and security
-FROM alpine:3.19 AS qnap-builder
+## Docker build tối giản để xuất binary chạy trên QNAP
+## Dùng chung cho Windows / macOS / Linux với Docker Desktop + buildx
+## Ví dụ:
+##   docker buildx build --platform linux/amd64 \
+##     --build-arg VERSION=2.0.0-qnap \
+##     -f Dockerfile.qnap \
+##     --output type=local,dest=./qnap-build .
+##
+## Kết quả:
+##   ./qnap-build/bin/{scanner,deleter,reporter,reporter_opt}
+##   ./qnap-build/qnap-scandir-<VERSION>-amd64.tar.gz
 
 ARG GO_VERSION=1.23.3
-ARG TARGETARCH=amd64
+ARG VERSION=dev
 ARG BUILD_DATE
+ARG TARGETARCH=amd64
 
-# Environment variables for QNAS optimization
+# Stage 1: builder với glibc 2.17 (tương thích QNAP cũ)
+FROM quay.io/pypa/manylinux2014_x86_64 AS builder
+# Nhắc lại ARG sau FROM để dùng trong stage này
+ARG GO_VERSION
+ARG VERSION
+ARG BUILD_DATE
+ARG TARGETARCH=amd64
+
 ENV GOROOT=/usr/local/go \
     GOPATH=/go \
-    PATH=/usr/local/go/bin:/go/bin:$PATH \
+    PATH=/usr/local/go/bin:/go/bin:${PATH} \
     CGO_ENABLED=1 \
     GOOS=linux \
-    GOARCH=amd64 \
-    PKG_CONFIG_PATH=/usr/lib/pkgconfig \
-    PKG_CONFIG_LIBDIR=/usr/lib/pkgconfig
+    GOARCH=${TARGETARCH}
 
-# Labels for metadata
-LABEL maintainer="Claude Code Assistant" \
-      description="Filesystem Scanner for QNAP NAS" \
-      version="2.0-optimized" \
-      build_date="${BUILD_DATE}" \
-      target_platform="QNAP NAS x86_64" \
-      base_image="alpine:3.19"
-
-# Install required packages for QNAS compatibility
-RUN apk add --no-cache \
-    gcc \
-    g++ \
-    musl-dev \
-    make \
-    curl \
-    wget \
-    tar \
-    sqlite-dev \
-    zlib-dev \
-    bzip2-dev \
-    openssl-dev \
-    pkgconfig \
-    upx \
-    ca-certificates \
-    tzdata \
-    git \
-    && rm -rf /var/cache/apk/*
-
-# Install Go for QNAS build
-RUN ARCH="amd64" && \
-    GO_ARCH="amd64" && \
-    wget -O /tmp/go.tar.gz "https://go.dev/dl/go${GO_VERSION}.linux-${GO_ARCH}.tar.gz" && \
-    tar -C /usr/local -xzf /tmp/go.tar.gz && \
-    rm -f /tmp/go.tar.gz
-
-# Verify Go installation
-RUN /usr/local/go/bin/go version
-
-# Configure musl for static linking compatibility
-RUN echo "Configure musl for static linking" && \
-    echo "LDFLAGS=\"-static-libgcc\"" >> /etc/profile.d/musl.sh
+RUN set -eux; \
+    GO_TARBALL_ARCH="${TARGETARCH}"; \
+    curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${GO_TARBALL_ARCH}.tar.gz" -o /tmp/go.tgz; \
+    tar -C /usr/local -xzf /tmp/go.tgz; \
+    rm -f /tmp/go.tgz
 
 WORKDIR /src
 
-# Copy Go module files for dependency caching
+# Cache dependencies
 COPY go.mod go.sum ./
+RUN go env -w GOMODCACHE=/go/pkg/mod && go mod download
 
-# Download dependencies with Alpine optimization
-RUN go env -w GOMODCACHE=/go/pkg/mod && \
-    go env -w GOCACHE=/tmp/.cache && \
-    go env -w GOPROXY=direct && \
-    go mod download && \
-    go mod tidy && \
-    go mod verify
-
-# Copy source code
+# Copy mã nguồn
 COPY . .
 
-# Build parameters for QNAS optimization
-ARG BUILD_FLAGS="-s -w -extldflags '-static-libgcc'"
-ARG QNAS_LDFLAGS="-X main.Version=2.0-qnap -X main.BuildDate=${BUILD_DATE} -X main.Target=QNAP-Alpine"
+# Build binaries (CGO link tới glibc 2.17)
+RUN set -eux; \
+    mkdir -p /out/bin; \
+    LDFLAGS="-s -w -X main.Version=${VERSION} -X main.BuildDate=${BUILD_DATE:-unknown} -X main.Target=${TARGETARCH}"; \
+    build() { /usr/local/go/bin/go build -trimpath -tags "$1" -ldflags "${LDFLAGS}" -o "/out/bin/$2" .; }; \
+    build scanner scanner; \
+    build deleter deleter; \
+    build reporter reporter; \
+    /usr/local/go/bin/go build -trimpath -tags reporter_optimized -ldflags "${LDFLAGS}" -o /out/bin/reporter_opt .
 
-# Create output directory
-RUN mkdir -p /out/qnap
+# Gói tar.gz phục vụ copy trực tiếp lên QNAP
+RUN set -eux; \
+    mkdir -p /out/package/bin /out/package/config; \
+    cp /out/bin/* /out/package/bin/; \
+    cp config.ini /out/package/config/config.ini.example; \
+    tar -czf "/out/qnap-scandir-${VERSION}-${TARGETARCH}.tar.gz" -C /out/package .
 
-# Build optimized binaries for QNAS
-RUN echo "Building scanner with static linking..." && \
-    /usr/local/go/bin/go build \
-    -tags scanner \
-    -trimpath \
-    -ldflags="${BUILD_FLAGS} ${QNAS_LDFLAGS}" \
-    -o /out/qnap/scanner .
+# Stage 2: runtime tối giản (nếu muốn chạy trong container)
+FROM gcr.io/distroless/base-debian12 AS runtime
+COPY --from=builder /out/bin/scanner /usr/local/bin/scanner
+ENTRYPOINT ["/usr/local/bin/scanner"]
 
-RUN echo "Building deleter with static linking..." && \
-    /usr/local/go/bin/go build \
-    -tags deleter \
-    -trimpath \
-    -ldflags="${BUILD_FLAGS} ${QNAS_LDFLAGS}" \
-    -o /out/qnap/deleter .
-
-RUN echo "Building optimized reporter with static linking..." && \
-    /usr/local/go/bin/go build \
-    -tags reporter_optimized \
-    -trimpath \
-    -ldflags="${BUILD_FLAGS} ${QNAS_LDFLAGS}" \
-    -o /out/qnap/reporter_opt \
-    .
-
-# Compress binaries for smaller deployment packages
-RUN upx --best --lzma /out/qnap/scanner && \
-    upx --best --lzma /out/qnap/deleter && \
-    upx --best --lzma /out/qnap/reporter_opt
-
-# Verify binaries and check dependencies
-RUN echo "=== Binary Information ===" && \
-    ls -la /out/qnap/ && \
-    echo "=== Dependency Check ===" && \
-    ldd /out/qnap/scanner 2>/dev/null || echo "Scanner: Static binary - no external dependencies" && \
-    ldd /out/qnap/deleter 2>/dev/null || echo "Deleter: Static binary - no external dependencies" && \
-    ldd /out/qnap/reporter 2>/dev/null || echo "Reporter: Static binary - no external dependencies" && \
-    ldd /out/qnap/reporter_opt 2>/dev/null || echo "Optimized Reporter: Static binary - no external dependencies"
-
-# Test binary functionality
-RUN echo "=== Binary Functionality Test ===" && \
-    /out/qnap/scanner --help >/dev/null 2>&1 && echo "✅ Scanner binary OK" || echo "❌ Scanner binary failed" && \
-    /out/qnap/deleter --help >/dev/null 2>&1 && echo "✅ Deleter binary OK" || echo "❌ Deleter binary failed" && \
-    /out/qnap/reporter --help >/dev/null 2>&1 && echo "✅ Reporter binary OK" || echo "❌ Reporter binary failed"
-
-# Get binary sizes for reporting
-RUN echo "=== Binary Sizes ===" && \
-    du -h /out/qnap/* | sort -h
-
-# ===== Stage 2: QNAS Runtime Container (Alpine minimal) =====
-FROM alpine:3.19 AS qnap-runtime
-
-# Install runtime dependencies for QNAS compatibility
-RUN apk add --no-cache \
-    ca-certificates \
-    tzdata \
-    sqlite \
-    curl \
-    && rm -rf /var/cache/apk/*
-
-# Create non-root user for QNAS security
-RUN addgroup -g 1000 scanner && \
-    adduser -D -s /bin/sh -u 1000 -G scanner scanner
-
-WORKDIR /app
-
-# Copy binaries from builder
-COPY --from=qnap-builder /out/qnap/ ./
-
-# Set ownership and permissions
-RUN chown -R scanner:scanner /app && \
-    chmod +x /app/*
-
-# Create QNAS-specific directories
-RUN mkdir -p /app/config /app/data /app/logs /app/output && \
-    chown -R scanner:scanner /app/config /app/data /app/logs /app/output
-
-# Switch to non-root user
-USER scanner
-
-# Add QNAS-specific labels
-LABEL maintainer="Claude Code Assistant" \
-      description="Filesystem Scanner for QNAP NAS" \
-      version="2.0-optimized" \
-      target_platform="QNAP NAS x86_64" \
-      base_image="alpine:3.19"
-
-# Default command
-CMD ["/bin/sh"]
-
-# ===== Stage 3: QNAS Artifact Export =====
-FROM scratch AS qnap-artifact
-
-# Copy only the binaries for minimal QNAS deployment
-COPY --from=qnap-builder /out/qnap/scanner /scanner
-COPY --from=qnap-builder /out/qnap/deleter /deleter
-COPY --from=qnap-builder /out/qnap/reporter /reporter
-COPY --from=qnap-builder /out/qnap/reporter_opt /reporter_opt
-
-# Metadata for QNAS deployment
-LABEL maintainer="Claude Code Assistant" \
-      description="Filesystem Scanner Binaries for QNAP NAS" \
-      version="2.0-optimized" \
-      target_platform="QNAP NAS x86_64" \
-      build_date="${BUILD_DATE}" \
-      base_image="alpine:3.19"
-
-# ===== Stage 4: QNAS Package Builder =====
-# Create deployment package for QNAP
-FROM alpine:3.19 AS qnap-package
-
-# Install packaging tools
-RUN apk add --no-cache tar gzip coreutils
-
-# Create package structure
-RUN mkdir -p /qnap-package/bin /qnap-package/config /qnap-package/scripts
-
-# Copy binaries
-COPY --from=qnap-builder /out/qnap/* /qnap-package/bin/
-
-# Copy default configuration
-COPY config.ini /qnap-package/config/config.ini.example
-
-# Create QNAS deployment scripts
-RUN cat > /qnap-package/scripts/deploy.sh << 'EOF'
-#!/bin/sh
-# QNAS Deployment Script
-set -e
-
-echo "🚀 Deploying Filesystem Scanner to QNAP NAS..."
-
-# Check if running on QNAP
-if [ ! -f /etc/default_config/uLinux.conf ]; then
-    echo "⚠️  Warning: This may not be a QNAP system"
-fi
-
-# Create directories
-mkdir -p /share/CACHEDEV1_DATA/.qpkg/scanner
-mkdir -p /share/CACHEDEV1_DATA/.qpkg/scanner/bin
-mkdir -p /share/CACHEDEV1_DATA/.qpkg/scanner/config
-mkdir -p /share/CACHEDEV1_DATA/.qpkg/scanner/data
-mkdir -p /share/CACHEDEV1_DATA/.qpkg/scanner/logs
-mkdir -p /share/CACHEDEV1_DATA/.qpkg/scanner/output
-
-# Copy binaries
-cp bin/* /share/CACHEDEV1_DATA/.qpkg/scanner/bin/
-chmod +x /share/CACHEDEV1_DATA/.qpkg/scanner/bin/*
-
-# Copy configuration if not exists
-if [ ! -f /share/CACHEDEV1_DATA/.qpkg/scanner/config/config.ini ]; then
-    cp config/config.ini.example /share/CACHEDEV1_DATA/.qpkg/scanner/config/config.ini
-    echo "📝 Created default configuration. Please edit: /share/CACHEDEV1_DATA/.qpkg/scanner/config/config.ini"
-fi
-
-echo "✅ Deployment complete!"
-echo "📍 Installation path: /share/CACHEDEV1_DATA/.qpkg/scanner"
-echo "📖 Edit configuration: /share/CACHEDEV1_DATA/.qpkg/scanner/config/config.ini"
-echo "🏃 Run scanner: /share/CACHEDEV1_DATA/.qpkg/scanner/bin/scanner"
-EOF
-
-RUN cat > /qnap-package/scripts/uninstall.sh << 'EOF'
-#!/bin/sh
-# QNAS Uninstall Script
-set -e
-
-echo "🗑️  Uninstalling Filesystem Scanner from QNAP NAS..."
-
-# Remove installation directory
-if [ -d /share/CACHEDEV1_DATA/.qpkg/scanner ]; then
-    rm -rf /share/CACHEDEV1_DATA/.qpkg/scanner
-    echo "✅ Removed scanner directory"
-fi
-
-echo "🏁 Uninstall complete!"
-EOF
-
-RUN cat > /qnap-package/README.md << 'EOF'
-# Filesystem Scanner for QNAP NAS
-
-## Installation
-
-1. Extract this package to your QNAP NAS
-2. Run: \`./scripts/deploy.sh\`
-3. Edit configuration: \`/share/CACHEDEV1_DATA/.qpkg/scanner/config/config.ini\`
-
-## Usage
-
-### Scan Filesystem
-\`/share/CACHEDEV1_DATA/.qpkg/scanner/bin/scanner\`
-
-### Generate Report
-\`/share/CACHEDEV1_DATA/.qpkg/scanner/bin/reporter -dbfile ./output/scan_*.db -format excel\`
-
-### Clean Database Entries
-\`/share/CACHEDEV1_DATA/.qpkg/scanner/bin/deleter -dbfile ./output/scan_*.db -path "/path/to/delete"\`
-
-## Important Notes
-
-- Default data location: \`/share/CACHEDEV1_DATA/.qpkg/scanner/\`
-- Logs are stored in: \`/share/CACHEDEV1_DATA/.qpkg/scanner/logs/\`
-- Database files: \`/share/CACHEDEV1_DATA/.qpkg/scanner/output/\`
-
-## Technical Details
-
-- Built with Alpine Linux 3.19 for maximum security
-- Static binaries with musl libc for compatibility
-- UPX compressed for smaller deployment size
-- Zero external dependencies required
-
-## Support
-
-For issues and questions, please refer to the project documentation.
-EOF
-
-# Make scripts executable
-RUN chmod +x /qnap-package/scripts/*.sh
-
-# Create deployment package
-WORKDIR /qnap-package
-RUN tar -czf /qnap-scanner-optimized-alpine.tar.gz .
-
-# Verify package
-RUN ls -la /qnap-scanner-optimized-alpine.tar.gz && \
-    echo "Package created successfully" && \
-    tar -tzf /qnap-scanner-optimized-alpine.tar.gz
-
-# Final stage outputs just the package
-FROM scratch
-COPY --from=qnap-package /qnap-scanner-optimized-alpine.tar.gz /qnap-scanner-optimized-alpine.tar.gz
-
-# Additional metadata
-LABEL maintainer="Claude Code Assistant" \
-      description="Filesystem Scanner Deployment Package for QNAP NAS" \
-      version="2.0-optimized" \
-      base_image="alpine:3.19" \
-      build_type="alpine-musl-static" \
-      features="static-binaries,upx-compressed,zero-dependencies"
+# Stage 3: artifact để xuất ra host (--output type=local)
+FROM scratch AS artifact
+COPY --from=builder /out/bin/ /bin/
+COPY --from=builder /out/qnap-scandir-*.tar.gz /packages/
