@@ -74,6 +74,7 @@ func initDDL(ctx context.Context, db *sql.DB) error {
 		  size BIGINT NOT NULL,
 		  st_mtime DATETIME NOT NULL,
 		  hash_value TEXT NULL, -- Sẽ được tool 'hasher' cập nhật
+		  is_duplicate BOOLEAN DEFAULT 0, -- Đánh dấu file là duplicate
 		  loaithumuc TEXT,
 		  thumuc TEXT,
 
@@ -83,6 +84,7 @@ func initDDL(ctx context.Context, db *sql.DB) error {
 		`CREATE UNIQUE INDEX idx_file_path ON fs_files (path);`,
 		`CREATE INDEX idx_file_size ON fs_files (size) WHERE size > 0;`,
 		`CREATE INDEX idx_file_hash ON fs_files (hash_value) WHERE hash_value IS NOT NULL;`,
+		`CREATE INDEX idx_file_is_duplicate ON fs_files (is_duplicate) WHERE is_duplicate = 1;`,
 
 		// Optimized performance indexes
 		`CREATE INDEX idx_file_size_hash_null ON fs_files (size) WHERE hash_value IS NULL;`,
@@ -97,6 +99,18 @@ func initDDL(ctx context.Context, db *sql.DB) error {
 		`CREATE INDEX idx_file_folder_loaithumuc_size ON fs_files (folder_id, loaithumuc, size DESC);`,
 		`CREATE INDEX idx_file_size_mtime ON fs_files (size DESC, st_mtime DESC);`,
 		`CREATE INDEX idx_file_hash_null_size ON fs_files (hash_value IS NULL, size DESC) WHERE hash_value IS NULL;`,
+		`CREATE INDEX idx_file_hash_duplicate ON fs_files (hash_value, is_duplicate) WHERE hash_value IS NOT NULL AND is_duplicate = 1;`,
+
+		// Bảng Duplicate Groups (để query nhanh hơn)
+		`CREATE TABLE duplicate_groups (
+		  hash_value TEXT PRIMARY KEY,
+		  file_count INTEGER NOT NULL,
+		  total_size BIGINT NOT NULL,
+		  first_seen DATETIME NOT NULL,
+		  last_updated DATETIME NOT NULL
+		)`,
+		`CREATE INDEX idx_duplicate_groups_size ON duplicate_groups (total_size DESC);`,
+		`CREATE INDEX idx_duplicate_groups_count ON duplicate_groups (file_count DESC);`,
 	}
 
 	for i, s := range stmts {

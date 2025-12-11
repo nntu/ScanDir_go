@@ -130,8 +130,8 @@ func (bs *BatchSizer) ShouldFlush(fileSize int64) bool {
 	bs.currentCount++
 
 	return bs.currentCount >= bs.maxBatch ||
-		   bs.currentSize >= bs.targetSize ||
-		   (bs.currentCount >= bs.minBatch && bs.currentSize >= bs.targetSize/2)
+		bs.currentSize >= bs.targetSize ||
+		(bs.currentCount >= bs.minBatch && bs.currentSize >= bs.targetSize/2)
 }
 
 // Reset resets the batch sizer state
@@ -142,12 +142,12 @@ func (bs *BatchSizer) Reset() {
 
 // MemoryAwareWorkerPool implements a worker pool with memory management
 type MemoryAwareWorkerPool struct {
-	workers      int
-	jobChan      chan FileToHash
-	resultChan   chan HashResult
-	done         chan struct{}
-	memLimit     int64
-	logger       *ScannerLogger
+	workers    int
+	jobChan    chan FileToHash
+	resultChan chan HashResult
+	done       chan struct{}
+	memLimit   int64
+	logger     *ScannerLogger
 }
 
 // NewMemoryAwareWorkerPool creates a new memory-aware worker pool
@@ -308,7 +308,7 @@ func getFilesByIDChunked(ctx context.Context, db *sql.DB, ids []int64) ([]FileTo
 	return allFiles, nil
 }
 
-// calculateHashWithContext calculates hash with context support
+// calculateHashWithContext calculates hash with context support (Optimized Version)
 func calculateHashWithContext(ctx context.Context, filePath string) (sql.NullString, error) {
 	// Check if file exists and get size
 	f, err := os.Open(filePath)
@@ -322,37 +322,64 @@ func calculateHashWithContext(ctx context.Context, filePath string) (sql.NullStr
 		return sql.NullString{}, err
 	}
 
+	fileSize := fi.Size()
+
 	// Skip empty files
-	if fi.Size() == 0 {
+	if fileSize == 0 {
 		return sql.NullString{Valid: false}, nil
 	}
 
 	h := md5.New()
 
-	// Use buffered reading for better performance
-	buf := make([]byte, 64*1024) // 64KB buffer
+	// Dynamic buffer size based on file size for better performance
+	// Small files: smaller buffer, large files: larger buffer
+	var bufSize int
+	switch {
+	case fileSize < 1024*1024: // < 1MB
+		bufSize = 32 * 1024 // 32KB
+	case fileSize < 100*1024*1024: // < 100MB
+		bufSize = 128 * 1024 // 128KB
+	default: // >= 100MB
+		bufSize = 256 * 1024 // 256KB
+	}
 
+	buf := make([]byte, bufSize)
+	var totalRead int64 = 0
+	checkInterval := int64(1024 * 1024) // Check context every 1MB
+
+	// Read file in chunks with optimized context checking
 	for {
+		// Check context periodically (every 1MB) to avoid overhead
+		if totalRead > 0 && totalRead%checkInterval == 0 {
+			select {
+			case <-ctx.Done():
+				return sql.NullString{}, ctx.Err()
+			default:
+			}
+		}
+
+		n, err := f.Read(buf)
+		if n > 0 {
+			if _, writeErr := h.Write(buf[:n]); writeErr != nil {
+				return sql.NullString{}, writeErr
+			}
+			totalRead += int64(n)
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return sql.NullString{}, err
+		}
+
+		// Check context before next read (non-blocking)
 		select {
 		case <-ctx.Done():
 			return sql.NullString{}, ctx.Err()
 		default:
-			n, err := f.Read(buf)
-			if n > 0 {
-				if _, err := h.Write(buf[:n]); err != nil {
-					return sql.NullString{}, err
-				}
-			}
-			if err == io.EOF {
-				goto done
-			}
-			if err != nil {
-				return sql.NullString{}, err
-			}
 		}
 	}
 
-done:
 	hashStr := hex.EncodeToString(h.Sum(nil))
 	return sql.NullString{String: hashStr, Valid: true}, nil
 }
@@ -698,53 +725,39 @@ func runHashingPhaseOptimized(ctx context.Context, db *sql.DB, cfg *Config) {
 	// Configure optimized database connections
 	configureDB(db, "hash", cfg.MaxWorkers)
 
-	// 1. Find potential duplicate groups safely
-	logger.logger.Info("Phase 2: Finding potential duplicates (groups of same-sized files)...")
+	// 1. Query ALL files needing hash in ONE query (eliminate N+1 problem)
+	logger.logger.Info("Phase 2: Finding files needing hash...")
 	rows, err := db.QueryContext(ctx, `
-		SELECT size, COUNT(*) as count
-		FROM fs_files
-		WHERE size > 0 AND hash_value IS NULL
-		GROUP BY size
-		HAVING count > 1
+		SELECT f1.id, f1.path
+		FROM fs_files f1
+		INNER JOIN (
+			SELECT size
+			FROM fs_files
+			WHERE size > 0 AND hash_value IS NULL
+			GROUP BY size
+			HAVING COUNT(*) > 1
+		) f2 ON f1.size = f2.size
+		WHERE f1.size > 0 AND f1.hash_value IS NULL
+		ORDER BY f1.size
 	`)
 	if err != nil {
-		logger.logger.Fatalf("Phase 2: Failed to query suspect groups: %v", err)
+		logger.logger.Fatalf("Phase 2: Failed to query files needing hash: %v", err)
 	}
 	defer rows.Close()
 
-	var suspectJobs []FileToHash
+	// Count total files first (for progress tracking)
 	var totalSuspects int64 = 0
-
-	// 2. Get file IDs using safe parameterized queries
+	var tempJobs []FileToHash
 	for rows.Next() {
-		var size int64
-		var count int
-		if err := rows.Scan(&size, &count); err != nil {
-			logger.logger.Fatalf("Phase 2: Failed to scan suspect group: %v", err)
-		}
-
-		// Get file IDs for this size group using parameterized query
-		sizeRows, err := db.QueryContext(ctx,
-			"SELECT id, path FROM fs_files WHERE size > 0 AND hash_value IS NULL AND size = ?", size)
-		if err != nil {
-			logger.logger.WithError(err).WithField("size", size).Warn("Failed to query paths for size group")
+		var job FileToHash
+		if err := rows.Scan(&job.ID, &job.Path); err != nil {
+			logger.logger.WithError(err).Warn("Failed to scan file row")
 			continue
 		}
-
-		groupJobs := []FileToHash{}
-		for sizeRows.Next() {
-			var job FileToHash
-			if err := sizeRows.Scan(&job.ID, &job.Path); err != nil {
-				logger.logger.WithError(err).Warn("Failed to scan file row")
-				continue
-			}
-			groupJobs = append(groupJobs, job)
-			totalSuspects++
-		}
-		sizeRows.Close()
-
-		suspectJobs = append(suspectJobs, groupJobs...)
+		tempJobs = append(tempJobs, job)
+		totalSuspects++
 	}
+	rows.Close()
 
 	if totalSuspects == 0 {
 		logger.logger.Info("Phase 2: No potential duplicates found. Hashing complete.")
@@ -754,116 +767,372 @@ func runHashingPhaseOptimized(ctx context.Context, db *sql.DB, cfg *Config) {
 
 	logger.logger.WithFields(logrus.Fields{
 		"totalFiles": totalSuspects,
-		"groupCount": len(suspectJobs),
 	}).Info("Phase 2: Found files needing hashing")
 
-	// 3. Initialize optimized worker pool with memory awareness
-	workerPool := NewMemoryAwareWorkerPool(cfg.MaxWorkers, 1024, logger) // 1GB memory limit
-	workerPool.Start()
-	defer workerPool.Stop()
+	// 2. Setup worker pool and channels
+	jobs := make(chan FileToHash, cfg.MaxWorkers*2)
+	results := make(chan HashResult, cfg.MaxWorkers*2)
 
-	// 4. Initialize rate-limited hasher
-	rateLimiter := NewRateLimitedHasher(cfg.MaxWorkers, 30*time.Second, 1024, logger) // 1GB max file size
+	// 3. Start hash workers (simplified, efficient version) with detailed logging
+	var wgWorkers sync.WaitGroup
+	var hashStats struct {
+		mu           sync.Mutex
+		totalHashed  int64
+		successCount int64
+		errorCount   int64
+		totalSize    int64
+		startTime    time.Time
+	}
+	hashStats.startTime = time.Now()
 
-	// 5. Submit jobs to worker pool
-	logger.logger.Info("Phase 2: Submitting jobs to worker pool...")
-	jobs := make(chan FileToHash, totalSuspects)
-	results := make(chan HashResult, totalSuspects)
-
-	// Start rate-limited hash workers
 	for w := 0; w < cfg.MaxWorkers; w++ {
-		go rateLimiter.HashWorker(jobs, results)
+		wgWorkers.Add(1)
+		go func(workerID int) {
+			defer wgWorkers.Done()
+			for job := range jobs {
+				hashStartTime := time.Now()
+				hash, err := calculateHashWithContext(ctx, job.Path)
+				hashDuration := time.Since(hashStartTime)
+
+				hashStats.mu.Lock()
+				hashStats.totalHashed++
+				if err == nil && hash.Valid {
+					hashStats.successCount++
+				} else {
+					hashStats.errorCount++
+					if err != nil {
+						logger.logger.WithFields(logrus.Fields{
+							"workerID": workerID,
+							"fileID":   job.ID,
+							"path":     job.Path,
+							"error":    err.Error(),
+							"duration": hashDuration.Milliseconds(),
+						}).Debug("Hash calculation failed")
+					}
+				}
+				hashStats.mu.Unlock()
+
+				results <- HashResult{ID: job.ID, Hash: hash, Err: err}
+			}
+		}(w)
 	}
 
-	// Submit all jobs
-	for _, job := range suspectJobs {
-		jobs <- job
-	}
-	close(jobs)
+	// 4. Submit jobs in background
+	go func() {
+		defer close(jobs)
+		for _, job := range tempJobs {
+			select {
+			case jobs <- job:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 
-	// 6. Collect results and update database with batch processing
-	logger.logger.Info("Phase 2: Collecting hash results and updating database...")
+	// 5. Collect results and update database with MULTIPLE smaller transactions
+	logger.logger.Info("Phase 2: Processing hash results and updating database...")
 
-	const batchSize = 100
+	const batchSize = 500        // Increased batch size for better performance
+	const commitBatchSize = 1000 // Commit every 1000 updates
 	var batch []HashResult
 	var updatedCount int64 = 0
+	var processedCount int64 = 0
 
-	tx, err := db.Begin()
-	if err != nil {
-		logger.logger.Fatalf("Phase 2: Failed to begin update transaction: %v", err)
-	}
+	// Start a goroutine to close results channel when all workers are done
+	go func() {
+		wgWorkers.Wait()
+		close(results)
+	}()
 
-	updateStmt, err := tx.PrepareContext(ctx, `UPDATE fs_files SET hash_value = ? WHERE id = ?`)
-	if err != nil {
-		tx.Rollback()
-		logger.logger.Fatalf("Phase 2: Failed to prepare update statement: %v", err)
-	}
-	defer updateStmt.Close()
+	// Process results with periodic commits
+	for res := range results {
+		processedCount++
 
-	for i := int64(0); i < totalSuspects; i++ {
-		res := <-results
 		if res.Err == nil && res.Hash.Valid {
 			batch = append(batch, res)
-
-			// Process batch
-			if len(batch) >= batchSize {
-				batchUpdated := processHashBatch(ctx, tx, updateStmt, batch, logger)
-				updatedCount += int64(batchUpdated)
-				batch = batch[:0]
-			}
 		} else if res.Err != nil {
 			logger.logger.WithFields(logrus.Fields{
 				"id":    res.ID,
 				"error": res.Err.Error(),
-			}).Warn("Hash calculation failed")
+			}).Debug("Hash calculation failed")
 		}
 
-		// Progress logging
-		if (i+1)%100 == 0 || i+1 == totalSuspects {
+		// Commit batch when it reaches commit size
+		if len(batch) >= commitBatchSize {
+			updated := commitHashBatch(ctx, db, batch, logger)
+			updatedCount += int64(updated)
+			batch = batch[:0]
+		}
+
+		// Progress logging every 1000 files with detailed stats
+		if processedCount%1000 == 0 || processedCount == totalSuspects {
+			hashStats.mu.Lock()
+			elapsed := time.Since(hashStats.startTime)
+			avgSpeed := float64(hashStats.totalHashed) / elapsed.Seconds()
+			successRate := float64(hashStats.successCount) / float64(hashStats.totalHashed) * 100
+			currentSuccess := hashStats.successCount
+			currentErrors := hashStats.errorCount
+			hashStats.mu.Unlock()
+
 			logger.logger.WithFields(logrus.Fields{
-				"processed": i + 1,
-				"total":     totalSuspects,
-				"updated":   updatedCount,
+				"processed":    processedCount,
+				"total":        totalSuspects,
+				"updated":      updatedCount,
+				"progress":     fmt.Sprintf("%.1f%%", float64(processedCount)*100/float64(totalSuspects)),
+				"hashed":       currentSuccess,
+				"errors":       currentErrors,
+				"successRate":  fmt.Sprintf("%.2f%%", successRate),
+				"avgSpeed":     fmt.Sprintf("%.2f files/sec", avgSpeed),
+				"elapsed":      elapsed.Seconds(),
+				"remainingEst": fmt.Sprintf("%.0f sec", float64(totalSuspects-processedCount)/avgSpeed),
 			}).Info("Phase 2: Hashing progress")
 		}
 	}
 
-	// Process remaining batch
+	// Commit remaining batch
 	if len(batch) > 0 {
-		batchUpdated := processHashBatch(ctx, tx, updateStmt, batch, logger)
-		updatedCount += int64(batchUpdated)
+		updated := commitHashBatch(ctx, db, batch, logger)
+		updatedCount += int64(updated)
 	}
 
-	if err := tx.Commit(); err != nil {
-		logger.logger.Fatalf("Phase 2: Failed to commit hash updates: %v", err)
-	}
+	// Final hash statistics
+	hashStats.mu.Lock()
+	totalElapsed := time.Since(hashStats.startTime)
+	finalSuccessRate := float64(hashStats.successCount) / float64(hashStats.totalHashed) * 100
+	finalAvgSpeed := float64(hashStats.totalHashed) / totalElapsed.Seconds()
+	hashStats.mu.Unlock()
 
 	logger.logger.WithFields(logrus.Fields{
-		"totalProcessed": totalSuspects,
+		"totalProcessed": processedCount,
 		"totalUpdated":   updatedCount,
+		"totalHashed":    hashStats.totalHashed,
+		"successCount":   hashStats.successCount,
+		"errorCount":     hashStats.errorCount,
+		"successRate":    fmt.Sprintf("%.2f%%", finalSuccessRate),
+		"avgSpeed":       fmt.Sprintf("%.2f files/sec", finalAvgSpeed),
+		"totalDuration":  totalElapsed.Seconds(),
 	}).Info("Phase 2: Hashing complete")
+
+	// 6. Đánh dấu duplicate files ngay sau khi hash xong
+	logger.logger.Info("Phase 2: Marking duplicate files...")
+	duplicateStats := markDuplicateFiles(ctx, db, logger)
+	logger.logger.WithFields(logrus.Fields{
+		"duplicateGroups": duplicateStats.Groups,
+		"duplicateFiles":  duplicateStats.Files,
+		"duplicateSize":   duplicateStats.TotalSize,
+	}).Info("Phase 2: Duplicate marking complete")
+
 	logger.logger.Info("-------------------------------------------------------")
 }
 
-// processHashBatch processes a batch of hash updates
-func processHashBatch(ctx context.Context, tx *sql.Tx, stmt *sql.Stmt, batch []HashResult, logger *ScannerLogger) int {
-	startTime := time.Now()
-	updated := 0
+// DuplicateStats holds statistics about duplicate files
+type DuplicateStats struct {
+	Groups    int64
+	Files     int64
+	TotalSize int64
+}
 
+// markDuplicateFiles marks files as duplicates based on hash_value
+func markDuplicateFiles(ctx context.Context, db *sql.DB, logger *ScannerLogger) DuplicateStats {
+	startTime := time.Now()
+	logger.logger.Info("Phase 2: Starting duplicate detection and marking...")
+
+	// Query để tìm các hash có >= 2 files (duplicate groups)
+	rows, err := db.QueryContext(ctx, `
+		SELECT hash_value, COUNT(*) as file_count, SUM(size) as total_size, MIN(st_mtime) as first_seen
+		FROM fs_files
+		WHERE hash_value IS NOT NULL AND hash_value != ''
+		GROUP BY hash_value
+		HAVING COUNT(*) > 1
+	`)
+	if err != nil {
+		logger.logger.WithError(err).Error("Failed to query duplicate groups")
+		return DuplicateStats{}
+	}
+	defer rows.Close()
+
+	var stats DuplicateStats
+	var duplicateHashes []string
+	var duplicateGroups []struct {
+		hashValue string
+		fileCount int
+		totalSize int64
+		firstSeen time.Time
+	}
+
+	for rows.Next() {
+		var hashValue string
+		var fileCount int
+		var totalSize int64
+		var firstSeen time.Time
+		if err := rows.Scan(&hashValue, &fileCount, &totalSize, &firstSeen); err != nil {
+			logger.logger.WithError(err).Warn("Failed to scan duplicate group")
+			continue
+		}
+		duplicateHashes = append(duplicateHashes, hashValue)
+		duplicateGroups = append(duplicateGroups, struct {
+			hashValue string
+			fileCount int
+			totalSize int64
+			firstSeen time.Time
+		}{hashValue, fileCount, totalSize, firstSeen})
+		stats.Groups++
+		stats.Files += int64(fileCount)
+		stats.TotalSize += totalSize
+	}
+
+	if len(duplicateHashes) == 0 {
+		logger.logger.Info("Phase 2: No duplicate groups found")
+		return stats
+	}
+
+	logger.logger.WithFields(logrus.Fields{
+		"groupsFound": stats.Groups,
+		"filesFound":  stats.Files,
+		"totalSizeMB": float64(stats.TotalSize) / 1024 / 1024,
+	}).Info("Phase 2: Found duplicate groups, starting marking process...")
+
+	// 1. Đánh dấu is_duplicate = 1 cho tất cả file có hash trong duplicate groups
+	markStartTime := time.Now()
+	placeholders := strings.Repeat("?,", len(duplicateHashes))
+	placeholders = placeholders[:len(placeholders)-1] // Remove trailing comma
+
+	markQuery := fmt.Sprintf(`
+		UPDATE fs_files 
+		SET is_duplicate = 1 
+		WHERE hash_value IN (%s) AND hash_value IS NOT NULL
+	`, placeholders)
+
+	args := make([]interface{}, len(duplicateHashes))
+	for i, hash := range duplicateHashes {
+		args[i] = hash
+	}
+
+	result, err := db.ExecContext(ctx, markQuery, args...)
+	if err != nil {
+		logger.logger.WithError(err).Error("Failed to mark duplicate files")
+		return stats
+	}
+
+	markedCount, _ := result.RowsAffected()
+	markDuration := time.Since(markStartTime)
+	logger.logger.WithFields(logrus.Fields{
+		"filesMarked": markedCount,
+		"duration":    markDuration.Milliseconds(),
+	}).Info("Phase 2: Marked duplicate files")
+
+	// 2. Insert/Update vào bảng duplicate_groups
+	groupStartTime := time.Now()
+	tx, err := db.Begin()
+	if err != nil {
+		logger.logger.WithError(err).Error("Failed to begin transaction for duplicate_groups")
+		return stats
+	}
+
+	stmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO duplicate_groups (hash_value, file_count, total_size, first_seen, last_updated)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(hash_value) DO UPDATE SET
+			file_count = excluded.file_count,
+			total_size = excluded.total_size,
+			last_updated = excluded.last_updated
+	`)
+	if err != nil {
+		tx.Rollback()
+		logger.logger.WithError(err).Error("Failed to prepare duplicate_groups statement")
+		return stats
+	}
+
+	now := time.Now()
+	groupsInserted := 0
+	for _, group := range duplicateGroups {
+		if _, err := stmt.ExecContext(ctx, group.hashValue, group.fileCount, group.totalSize, group.firstSeen, now); err != nil {
+			logger.logger.WithFields(logrus.Fields{
+				"hash":  group.hashValue,
+				"error": err.Error(),
+			}).Warn("Failed to insert duplicate group")
+			continue
+		}
+		groupsInserted++
+	}
+	stmt.Close()
+
+	if err := tx.Commit(); err != nil {
+		logger.logger.WithError(err).Error("Failed to commit duplicate_groups")
+		return stats
+	}
+
+	groupDuration := time.Since(groupStartTime)
+	totalDuration := time.Since(startTime)
+
+	logger.logger.WithFields(logrus.Fields{
+		"duplicateGroups": stats.Groups,
+		"duplicateFiles":  stats.Files,
+		"duplicateSizeMB": fmt.Sprintf("%.2f", float64(stats.TotalSize)/1024/1024),
+		"duplicateSizeGB": fmt.Sprintf("%.2f", float64(stats.TotalSize)/1024/1024/1024),
+		"groupsInserted":  groupsInserted,
+		"markDuration":    markDuration.Milliseconds(),
+		"groupDuration":   groupDuration.Milliseconds(),
+		"totalDuration":   totalDuration.Milliseconds(),
+	}).Info("Phase 2: Duplicate detection and marking completed successfully")
+
+	return stats
+}
+
+// commitHashBatch commits a batch of hash updates in a single transaction
+func commitHashBatch(ctx context.Context, db *sql.DB, batch []HashResult, logger *ScannerLogger) int {
+	if len(batch) == 0 {
+		return 0
+	}
+
+	startTime := time.Now()
+	tx, err := db.Begin()
+	if err != nil {
+		logger.logger.WithError(err).Error("Failed to begin transaction for hash batch")
+		return 0
+	}
+
+	// Use prepared statement for better performance
+	stmt, err := tx.PrepareContext(ctx, `UPDATE fs_files SET hash_value = ? WHERE id = ?`)
+	if err != nil {
+		tx.Rollback()
+		logger.logger.WithError(err).Error("Failed to prepare update statement")
+		return 0
+	}
+
+	updated := 0
+	failed := 0
 	for _, res := range batch {
-		_, err := stmt.ExecContext(ctx, res.Hash.String, res.ID)
-		if err != nil {
+		if _, err := stmt.ExecContext(ctx, res.Hash.String, res.ID); err != nil {
+			failed++
 			logger.logger.WithFields(logrus.Fields{
 				"id":    res.ID,
 				"error": err.Error(),
-			}).Warn("Failed to update hash for ID")
+			}).Debug("Failed to update hash")
 		} else {
 			updated++
 		}
 	}
+	stmt.Close()
+
+	if err := tx.Commit(); err != nil {
+		logger.logger.WithError(err).Error("Failed to commit hash batch")
+		return 0
+	}
 
 	duration := time.Since(startTime)
 	logger.LogBatchOperation("hash_update", updated, duration, nil)
+
+	// Detailed logging for batch commit
+	if updated > 0 {
+		logger.logger.WithFields(logrus.Fields{
+			"batchSize":  len(batch),
+			"updated":    updated,
+			"failed":     failed,
+			"duration":   duration.Milliseconds(),
+			"throughput": fmt.Sprintf("%.2f updates/sec", float64(updated)/duration.Seconds()),
+		}).Debug("Hash batch committed")
+	}
 
 	return updated
 }
@@ -906,8 +1175,8 @@ func configureDB(db *sql.DB, phase string, workers int) {
 	case "delete":
 		db.Exec("PRAGMA foreign_keys = ON")
 	case "report":
-		db.Exec("PRAGMA query_only = 1") // Read-only for reporting
-		db.Exec("PRAGMA cache_size = -128000") // 128MB cache for reporting
+		db.Exec("PRAGMA query_only = 1")        // Read-only for reporting
+		db.Exec("PRAGMA cache_size = -128000")  // 128MB cache for reporting
 		db.Exec("PRAGMA mmap_size = 536870912") // 512MB memory map for reporting
 	}
 }
@@ -930,20 +1199,20 @@ type DynamicConfig struct {
 
 	// Runtime tunable parameters
 	AdjustedBatchSize int
-	AdjustedWorkers  int
-	AdjustedTimeout  time.Duration
+	AdjustedWorkers   int
+	AdjustedTimeout   time.Duration
 }
 
 // NewDynamicConfig creates a new dynamic configuration
 func NewDynamicConfig(baseCfg *Config, memLimitMB int64, logger *ScannerLogger) *DynamicConfig {
 	return &DynamicConfig{
-		Config:           baseCfg,
-		logger:           logger,
-		memLimit:         memLimitMB * 1024 * 1024, // Convert to bytes
-		lastAdjustment:   time.Now(),
+		Config:            baseCfg,
+		logger:            logger,
+		memLimit:          memLimitMB * 1024 * 1024, // Convert to bytes
+		lastAdjustment:    time.Now(),
 		AdjustedBatchSize: baseCfg.BatchSize,
-		AdjustedWorkers:  baseCfg.MaxWorkers,
-		AdjustedTimeout:  30 * time.Second,
+		AdjustedWorkers:   baseCfg.MaxWorkers,
+		AdjustedTimeout:   30 * time.Second,
 	}
 }
 
@@ -998,9 +1267,9 @@ func (dc *DynamicConfig) AutoAdjust() {
 			newWorkers := max(1, dc.AdjustedWorkers-1)
 			if newWorkers != dc.AdjustedWorkers {
 				dc.logger.logger.WithFields(logrus.Fields{
-					"oldWorkers":  dc.AdjustedWorkers,
-					"newWorkers":  newWorkers,
-					"cpuLoad":     loadPercent,
+					"oldWorkers": dc.AdjustedWorkers,
+					"newWorkers": newWorkers,
+					"cpuLoad":    loadPercent,
 				}).Info("Reducing worker count due to high CPU usage")
 				dc.AdjustedWorkers = newWorkers
 			}
@@ -1009,9 +1278,9 @@ func (dc *DynamicConfig) AutoAdjust() {
 			newWorkers := min(cpuCount*2, dc.AdjustedWorkers+1)
 			if newWorkers != dc.AdjustedWorkers {
 				dc.logger.logger.WithFields(logrus.Fields{
-					"oldWorkers":  dc.AdjustedWorkers,
-					"newWorkers":  newWorkers,
-					"cpuLoad":     loadPercent,
+					"oldWorkers": dc.AdjustedWorkers,
+					"newWorkers": newWorkers,
+					"cpuLoad":    loadPercent,
 				}).Info("Increasing worker count due to low CPU usage")
 				dc.AdjustedWorkers = newWorkers
 			}
@@ -1125,10 +1394,10 @@ func main() {
 			} else {
 				duration := time.Since(startTime)
 				logger.logger.WithFields(logrus.Fields{
-					"path":      root,
-					"tag":       tag,
-					"fileCount": count,
-					"duration":  duration.Milliseconds(),
+					"path":       root,
+					"tag":        tag,
+					"fileCount":  count,
+					"duration":   duration.Milliseconds(),
 					"throughput": float64(count) / duration.Seconds(),
 				}).Info("Phase 1: path scan completed")
 
