@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -16,6 +17,11 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/sirupsen/logrus"
 )
+
+type deleteFilter struct {
+	SizeZero bool
+	Exts     []string // normalized, e.g. ".tmp"
+}
 
 // configureDB configures database connection settings for optimal performance
 func configureDB(db *sql.DB, phase string, workers int) {
@@ -97,6 +103,177 @@ func validateDeletePath(path string) error {
 	return nil
 }
 
+func normalizeExtList(extsCSV string) []string {
+	extsCSV = strings.TrimSpace(extsCSV)
+	if extsCSV == "" {
+		return nil
+	}
+	parts := strings.Split(extsCSV, ",")
+	out := make([]string, 0, len(parts))
+	seen := map[string]struct{}{}
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if !strings.HasPrefix(p, ".") {
+			p = "." + p
+		}
+		p = strings.ToLower(p)
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
+		out = append(out, p)
+	}
+	return out
+}
+
+func buildInPlaceholders(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return strings.TrimRight(strings.Repeat("?,", n), ",")
+}
+
+func deleteByConditions(ctx context.Context, db *sql.DB, logger *logrus.Logger, basePath string, filter deleteFilter, deleteDisk bool, dryRun bool, limit int) (int64, int64, int64, error) {
+	// returns: dbDeleted, diskDeleted, errors
+	var dbDeleted int64
+	var diskDeleted int64
+	var errCount int64
+
+	cleanPath := filepath.ToSlash(basePath)
+	likePath := cleanPath
+	if !strings.HasSuffix(likePath, "/") {
+		likePath += "/"
+	}
+	likePath += "%"
+
+	clauses := []string{
+		`(path = ? OR path LIKE ? OR dir_path = ? OR dir_path LIKE ?)`,
+	}
+	args := []any{cleanPath, likePath, cleanPath, likePath}
+
+	if filter.SizeZero {
+		clauses = append(clauses, `size = 0`)
+	}
+	if len(filter.Exts) > 0 {
+		clauses = append(clauses, fmt.Sprintf(`LOWER(fileExt) IN (%s)`, buildInPlaceholders(len(filter.Exts))))
+		for _, e := range filter.Exts {
+			args = append(args, e)
+		}
+	}
+
+	query := fmt.Sprintf(`
+		SELECT id, path
+		FROM fs_files
+		WHERE %s
+		ORDER BY id
+	`, strings.Join(clauses, " AND "))
+
+	if limit > 0 {
+		query += fmt.Sprintf(" LIMIT %d", limit)
+	}
+
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("query filter delete: %w", err)
+	}
+	defer rows.Close()
+
+	type idPath struct {
+		id   int64
+		path string
+	}
+	const commitBatch = 1000
+	batch := make([]idPath, 0, commitBatch)
+
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+
+		if dryRun {
+			dbDeleted += int64(len(batch)) // "would delete" in DB
+			batch = batch[:0]
+			return nil
+		}
+
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+
+		delStmt, err := tx.PrepareContext(ctx, `DELETE FROM fs_files WHERE id = ?`)
+		if err != nil {
+			return err
+		}
+		defer delStmt.Close()
+
+		for _, it := range batch {
+			if deleteDisk {
+				// Windows chấp nhận path dạng '/', giữ nguyên; nhưng vẫn clean nhẹ.
+				p := filepath.Clean(filepath.FromSlash(it.path))
+				if rmErr := os.Remove(p); rmErr != nil {
+					// Nếu file không tồn tại, vẫn cho xóa record DB để "dọn" index.
+					if !os.IsNotExist(rmErr) {
+						errCount++
+						logger.WithFields(logrus.Fields{
+							"path":  it.path,
+							"error": rmErr.Error(),
+						}).Warn("Failed to delete file from disk")
+						continue
+					}
+				} else {
+					diskDeleted++
+				}
+			}
+
+			if _, err := delStmt.ExecContext(ctx, it.id); err != nil {
+				errCount++
+				logger.WithFields(logrus.Fields{
+					"id":    it.id,
+					"path":  it.path,
+					"error": err.Error(),
+				}).Warn("Failed to delete row from database")
+				continue
+			}
+			dbDeleted++
+		}
+
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		batch = batch[:0]
+		return nil
+	}
+
+	for rows.Next() {
+		var id int64
+		var p string
+		if err := rows.Scan(&id, &p); err != nil {
+			errCount++
+			logger.WithError(err).Warn("Failed to scan fs_files row")
+			continue
+		}
+		batch = append(batch, idPath{id: id, path: p})
+		if len(batch) >= commitBatch {
+			if err := flush(); err != nil {
+				return dbDeleted, diskDeleted, errCount, err
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return dbDeleted, diskDeleted, errCount, err
+	}
+	if err := flush(); err != nil {
+		return dbDeleted, diskDeleted, errCount, err
+	}
+
+	return dbDeleted, diskDeleted, errCount, nil
+}
+
 // ----------------------------
 // main (deleter) - Optimized Version
 // ----------------------------
@@ -113,16 +290,22 @@ func main() {
 
 	// Parse command line arguments
 	dbFile := flag.String("dbfile", "", "Path to the scan.db file (e.g., ./output_scans/scan_....db)")
-	pathToDelete := flag.String("path", "", "Absolute path of the file or folder to delete (from DB only)")
+	pathToDelete := flag.String("path", "", "Absolute path of the file/folder scope (required for safety)")
 	verbose := flag.Bool("verbose", false, "Enable verbose logging")
 	dryRun := flag.Bool("dry-run", false, "Show what would be deleted without actually deleting")
+	deleteDisk := flag.Bool("delete-disk", false, "Delete matching files from disk (DANGEROUS). If false: delete from DB only")
+
+	// Filter mode
+	filterSizeZero := flag.Bool("size-zero", false, "Filter: only files with size = 0")
+	filterExts := flag.String("ext", "", "Filter: file extensions, comma-separated (e.g. .tmp,.log,.bak)")
+	limit := flag.Int("limit", 0, "Safety: max number of files to delete (0 = no limit)")
 	flag.Parse()
 
 	if *dbFile == "" {
 		logger.Fatal("Error: -dbfile flag is required.")
 	}
 	if *pathToDelete == "" {
-		logger.Fatal("Error: -path flag is required.")
+		logger.Fatal("Error: -path flag is required (safety).")
 	}
 
 	if *verbose {
@@ -141,11 +324,22 @@ func main() {
 		logger.Fatalf("Path validation failed: %v", err)
 	}
 
+	filter := deleteFilter{
+		SizeZero: *filterSizeZero,
+		Exts:     normalizeExtList(*filterExts),
+	}
+	useFilter := filter.SizeZero || len(filter.Exts) > 0
+
 	logger.WithFields(logrus.Fields{
-		"dbPath":   *dbFile,
-		"filePath": cleanPath,
-		"dryRun":   *dryRun,
-	}).Info("Attempting to delete from database")
+		"dbPath":     *dbFile,
+		"scopePath":  cleanPath,
+		"dryRun":     *dryRun,
+		"deleteDisk": *deleteDisk,
+		"filterMode": useFilter,
+		"sizeZero":   filter.SizeZero,
+		"extFilters": filter.Exts,
+		"limit":      *limit,
+	}).Info("Starting deletion job")
 
 	// Open database with optimized settings
 	db, err := openDBSQLite(*dbFile)
@@ -159,6 +353,24 @@ func main() {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
+
+	// FILTER MODE: delete by conditions within scopePath
+	if useFilter {
+		startTime := time.Now()
+		dbDeleted, diskDeleted, errCount, err := deleteByConditions(ctx, db, logger, cleanPath, filter, *deleteDisk, *dryRun, *limit)
+		if err != nil {
+			logger.WithError(err).Fatal("Filter deletion failed")
+		}
+		duration := time.Since(startTime)
+		logger.WithFields(logrus.Fields{
+			"dbDeleted":   dbDeleted,
+			"diskDeleted": diskDeleted,
+			"errors":      errCount,
+			"duration_ms": duration.Milliseconds(),
+			"itemsPerSec": float64(dbDeleted) / duration.Seconds(),
+		}).Info("Filter deletion completed")
+		return
+	}
 
 	// Check if path exists in database before deletion (for dry run)
 	if *dryRun {
@@ -199,7 +411,11 @@ func main() {
 		"itemsPerSecond": float64(foldersDeleted+filesDeleted) / duration.Seconds(),
 	}).Info("Deletion completed successfully")
 
-	logger.Info("NOTE: This tool does NOT delete files from the actual filesystem, only from the database.")
+	if *deleteDisk {
+		logger.Warn("NOTE: -delete-disk is currently supported only in filter mode (e.g. -size-zero / -ext). Without filters, this run deleted from DB only.")
+	} else {
+		logger.Info("NOTE: This tool deletes from DB. Use -delete-disk with filter flags to delete files from disk as well.")
+	}
 }
 
 // Legacy main function for backward compatibility

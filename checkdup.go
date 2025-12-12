@@ -21,6 +21,33 @@ type dupGroupRow struct {
 	FirstSeen time.Time
 }
 
+func parseSQLiteTime(s string) (time.Time, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return time.Time{}, fmt.Errorf("empty time")
+	}
+	layouts := []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		// SQLite TEXT với timezone offset (có dấu cách thay vì 'T')
+		"2006-01-02 15:04:05.999999999Z07:00",
+		"2006-01-02 15:04:05Z07:00",
+		"2006-01-02 15:04:05.999999999",
+		"2006-01-02 15:04:05",
+		"2006-01-02T15:04:05.999999999Z07:00",
+		"2006-01-02T15:04:05Z07:00",
+	}
+	var lastErr error
+	for _, layout := range layouts {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, nil
+		} else {
+			lastErr = err
+		}
+	}
+	return time.Time{}, fmt.Errorf("cannot parse time %q: %w", s, lastErr)
+}
+
 func configureDBForCheckDup(db *sql.DB) {
 	// Tối ưu nhẹ cho job vừa đọc vừa ghi
 	db.SetMaxOpenConns(2)
@@ -207,14 +234,8 @@ func runCheckDup(ctx context.Context, db *sql.DB, dbFile string, reset bool, fro
 	}
 
 	var lastHash sql.NullString
-	defer func() {
-		// Nếu panic/error: status sẽ được set ở nơi gọi; ở đây chỉ là fallback
-		if lastHash.Valid {
-			finishRun(ctx, db, runID, "failed", lastHash)
-		} else {
-			finishRun(ctx, db, runID, "failed", sql.NullString{})
-		}
-	}()
+	status := "failed"
+	defer func() { finishRun(ctx, db, runID, status, lastHash) }()
 
 	log.Printf("Start checkdup run_id=%d total_groups=%d ...", runID, totalGroups)
 
@@ -252,8 +273,20 @@ func runCheckDup(ctx context.Context, db *sql.DB, dbFile string, reset bool, fro
 
 	for rows.Next() {
 		var g dupGroupRow
-		if err := rows.Scan(&g.HashValue, &g.FileCount, &g.TotalSize, &g.FirstSeen); err != nil {
+		var firstSeenRaw sql.NullString
+		if err := rows.Scan(&g.HashValue, &g.FileCount, &g.TotalSize, &firstSeenRaw); err != nil {
 			return fmt.Errorf("scan group row: %w", err)
+		}
+		if firstSeenRaw.Valid {
+			if t, err := parseSQLiteTime(firstSeenRaw.String); err == nil {
+				g.FirstSeen = t
+			} else {
+				// Không fail cả job chỉ vì parse time; fallback now và log warn.
+				g.FirstSeen = time.Now()
+				log.Printf("WARN: cannot parse first_seen=%q for hash=%s: %v", firstSeenRaw.String, g.HashValue, err)
+			}
+		} else {
+			g.FirstSeen = time.Now()
 		}
 		batch = append(batch, g)
 
@@ -282,7 +315,7 @@ func runCheckDup(ctx context.Context, db *sql.DB, dbFile string, reset bool, fro
 	}
 
 	// Done
-	finishRun(ctx, db, runID, "done", lastHash)
+	status = "done"
 	log.Printf("DONE: run_id=%d groups=%d files=%d size=%.2fGB last=%s",
 		runID, processedGroups, processedFiles, float64(processedSize)/(1024*1024*1024), lastHash.String)
 
