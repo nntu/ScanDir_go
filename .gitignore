@@ -21,5 +21,6 @@
 go.work
 
 .env
-
+output_dir/
 output_scans/
+qnap-build/

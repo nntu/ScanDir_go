@@ -7,7 +7,7 @@
 ##     --output type=local,dest=./qnap-build .
 ##
 ## Kết quả:
-##   ./qnap-build/bin/{scanner,deleter,reporter,reporter_opt}
+##   ./qnap-build/bin/{scanner,deleter,reporter,reporter_opt,checkdup}
 ##   ./qnap-build/qnap-scandir-<VERSION>-amd64.tar.gz
 
 ARG GO_VERSION=1.23.3
@@ -53,6 +53,7 @@ RUN set -eux; \
     build scanner scanner; \
     build deleter deleter; \
     build reporter reporter; \
+    build checkdup checkdup; \
     /usr/local/go/bin/go build -trimpath -tags reporter_optimized -ldflags "${LDFLAGS}" -o /out/bin/reporter_opt .
 
 # Gói tar.gz phục vụ copy trực tiếp lên QNAP

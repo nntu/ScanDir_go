@@ -1,0 +1,4 @@
+# Tránh gửi dữ liệu output (DB lớn) vào Docker build context
+output_dir/
+
+

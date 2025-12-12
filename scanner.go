@@ -725,10 +725,11 @@ func runHashingPhaseOptimized(ctx context.Context, db *sql.DB, cfg *Config) {
 	// Configure optimized database connections
 	configureDB(db, "hash", cfg.MaxWorkers)
 
-	// 1. Query ALL files needing hash in ONE query (eliminate N+1 problem)
-	logger.logger.Info("Phase 2: Finding files needing hash...")
-	rows, err := db.QueryContext(ctx, `
-		SELECT f1.id, f1.path
+	// 1) Đếm tổng số file cần hash (để progress) nhưng KHÔNG load toàn bộ rows vào RAM.
+	logger.logger.Info("Phase 2: Counting files needing hash (no in-memory buffering)...")
+	var totalSuspects int64
+	err := db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
 		FROM fs_files f1
 		INNER JOIN (
 			SELECT size
@@ -738,26 +739,10 @@ func runHashingPhaseOptimized(ctx context.Context, db *sql.DB, cfg *Config) {
 			HAVING COUNT(*) > 1
 		) f2 ON f1.size = f2.size
 		WHERE f1.size > 0 AND f1.hash_value IS NULL
-		ORDER BY f1.size
-	`)
+	`).Scan(&totalSuspects)
 	if err != nil {
-		logger.logger.Fatalf("Phase 2: Failed to query files needing hash: %v", err)
+		logger.logger.Fatalf("Phase 2: Failed to count files needing hash: %v", err)
 	}
-	defer rows.Close()
-
-	// Count total files first (for progress tracking)
-	var totalSuspects int64 = 0
-	var tempJobs []FileToHash
-	for rows.Next() {
-		var job FileToHash
-		if err := rows.Scan(&job.ID, &job.Path); err != nil {
-			logger.logger.WithError(err).Warn("Failed to scan file row")
-			continue
-		}
-		tempJobs = append(tempJobs, job)
-		totalSuspects++
-	}
-	rows.Close()
 
 	if totalSuspects == 0 {
 		logger.logger.Info("Phase 2: No potential duplicates found. Hashing complete.")
@@ -820,12 +805,44 @@ func runHashingPhaseOptimized(ctx context.Context, db *sql.DB, cfg *Config) {
 	// 4. Submit jobs in background
 	go func() {
 		defer close(jobs)
-		for _, job := range tempJobs {
+
+		// Stream rows -> jobs (backpressure qua channel), tránh giữ 4-5 triệu rows trong RAM.
+		logger.logger.Info("Phase 2: Streaming files needing hash to workers...")
+		rows, err := db.QueryContext(ctx, `
+			SELECT f1.id, f1.path
+			FROM fs_files f1
+			INNER JOIN (
+				SELECT size
+				FROM fs_files
+				WHERE size > 0 AND hash_value IS NULL
+				GROUP BY size
+				HAVING COUNT(*) > 1
+			) f2 ON f1.size = f2.size
+			WHERE f1.size > 0 AND f1.hash_value IS NULL
+			ORDER BY f1.size
+		`)
+		if err != nil {
+			logger.logger.WithError(err).Error("Phase 2: Failed to query files needing hash")
+			return
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var job FileToHash
+			if err := rows.Scan(&job.ID, &job.Path); err != nil {
+				logger.logger.WithError(err).Warn("Phase 2: Failed to scan file row")
+				continue
+			}
+
 			select {
 			case jobs <- job:
 			case <-ctx.Done():
 				return
 			}
+		}
+
+		if err := rows.Err(); err != nil {
+			logger.logger.WithError(err).Warn("Phase 2: Row iteration error while streaming hash jobs")
 		}
 	}()
 

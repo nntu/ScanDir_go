@@ -1,5 +1,5 @@
 // common_db.go
-//go:build scanner || deleter || reporter
+//go:build scanner || deleter || reporter || checkdup
 
 package main
 
@@ -111,6 +111,22 @@ func initDDL(ctx context.Context, db *sql.DB) error {
 		)`,
 		`CREATE INDEX idx_duplicate_groups_size ON duplicate_groups (total_size DESC);`,
 		`CREATE INDEX idx_duplicate_groups_count ON duplicate_groups (file_count DESC);`,
+
+		// Bảng theo dõi tiến độ chạy check-duplicate (để rerun/monitor)
+		`CREATE TABLE duplicate_runs (
+		  id INTEGER PRIMARY KEY AUTOINCREMENT,
+		  started_at DATETIME NOT NULL,
+		  finished_at DATETIME NULL,
+		  status TEXT NOT NULL, -- running|done|failed
+		  total_groups INTEGER DEFAULT 0,
+		  processed_groups INTEGER DEFAULT 0,
+		  processed_files INTEGER DEFAULT 0,
+		  processed_size BIGINT DEFAULT 0,
+		  last_hash_value TEXT NULL,
+		  note TEXT NULL
+		)`,
+		`CREATE INDEX idx_duplicate_runs_status ON duplicate_runs (status);`,
+		`CREATE INDEX idx_duplicate_runs_started_at ON duplicate_runs (started_at DESC);`,
 	}
 
 	for i, s := range stmts {

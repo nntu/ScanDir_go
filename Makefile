@@ -7,6 +7,7 @@ SCANNER_BIN := scanner
 DELETER_BIN := deleter
 REPORTER_BIN := reporter
 REPORTER_OPT_BIN := reporter_opt
+CHECKDUP_BIN := checkdup
 
 # Các target mặc định và giả (phony targets)
 .PHONY: all build-image create-container copy-scanner copy-deleter copy-reporter copy-reporter-opt remove-container extract-binaries clean build-local test
@@ -23,6 +24,8 @@ build-local:
 	go build -tags deleter -trimpath -ldflags="-s -w" -o $(DELETER_BIN) .
 	@echo "Building reporter..."
 	go build -tags reporter -trimpath -ldflags="-s -w" -o $(REPORTER_BIN) .
+	@echo "Building checkdup..."
+	go build -tags checkdup -trimpath -ldflags="-s -w" -o $(CHECKDUP_BIN) .
 	@echo "Building optimized reporter..."
 	go build -tags reporter -trimpath -ldflags="-s -w" -o $(REPORTER_OPT_BIN) report_optimized.go
 	@echo "Local build complete!"

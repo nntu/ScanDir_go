@@ -15,6 +15,7 @@ set SCANNER_BIN=scanner
 set DELETER_BIN=deleter
 set REPORTER_BIN=reporter
 set REPORTER_OPT_BIN=reporter_opt
+set CHECKDUP_BIN=checkdup
 
 REM Default target
 if "%1"=="" set TARGET=all
@@ -121,6 +122,13 @@ echo Building reporter...
 go build -tags reporter -trimpath -ldflags="-s -w" -o %REPORTER_BIN% .
 if !errorlevel! neq 0 (
     call :show_error "Failed to build reporter"
+    exit /b 1
+)
+
+echo Building checkdup...
+go build -tags checkdup -trimpath -ldflags="-s -w" -o %CHECKDUP_BIN% .
+if !errorlevel! neq 0 (
+    call :show_error "Failed to build checkdup"
     exit /b 1
 )
 
