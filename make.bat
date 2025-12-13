@@ -133,7 +133,7 @@ if !errorlevel! neq 0 (
 )
 
 echo Building optimized reporter...
-go build -tags reporter -trimpath -ldflags="-s -w" -o %REPORTER_OPT_BIN% report_optimized.go
+go build -tags reporter_optimized -trimpath -ldflags="-s -w" -o %REPORTER_OPT_BIN% .
 if !errorlevel! neq 0 (
     call :show_warning "Failed to build optimized reporter (may not be needed)"
 )

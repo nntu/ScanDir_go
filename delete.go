@@ -376,15 +376,25 @@ func main() {
 	if *dryRun {
 		logger.Info("DRY RUN: Checking what would be deleted...")
 
+		likePath := cleanPath
+		if !strings.HasSuffix(likePath, "/") {
+			likePath += "/"
+		}
+		likePath += "%"
+
 		// Check folders
 		var folderCount int64
-		folderQuery := `SELECT COUNT(*) FROM fs_folders WHERE path = ? OR path LIKE ? || '%'`
-		db.QueryRowContext(ctx, folderQuery, cleanPath, cleanPath).Scan(&folderCount)
+		folderQuery := `SELECT COUNT(*) FROM fs_folders WHERE path = ? OR path LIKE ?`
+		if err := db.QueryRowContext(ctx, folderQuery, cleanPath, likePath).Scan(&folderCount); err != nil {
+			logger.WithError(err).Fatal("DRY RUN: Failed to count matching folders")
+		}
 
 		// Check files
 		var fileCount int64
-		fileQuery := `SELECT COUNT(*) FROM fs_files WHERE path = ? OR dir_path = ? OR dir_path LIKE ? || '%'`
-		db.QueryRowContext(ctx, fileQuery, cleanPath, cleanPath, cleanPath).Scan(&fileCount)
+		fileQuery := `SELECT COUNT(*) FROM fs_files WHERE path = ? OR dir_path = ? OR dir_path LIKE ? OR path LIKE ?`
+		if err := db.QueryRowContext(ctx, fileQuery, cleanPath, cleanPath, likePath, likePath).Scan(&fileCount); err != nil {
+			logger.WithError(err).Fatal("DRY RUN: Failed to count matching files")
+		}
 
 		logger.WithFields(logrus.Fields{
 			"foldersFound": folderCount,

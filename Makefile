@@ -27,7 +27,7 @@ build-local:
 	@echo "Building checkdup..."
 	go build -tags checkdup -trimpath -ldflags="-s -w" -o $(CHECKDUP_BIN) .
 	@echo "Building optimized reporter..."
-	go build -tags reporter -trimpath -ldflags="-s -w" -o $(REPORTER_OPT_BIN) report_optimized.go
+	go build -tags reporter_optimized -trimpath -ldflags="-s -w" -o $(REPORTER_OPT_BIN) .
 	@echo "Local build complete!"
 
 # Target để chạy tests

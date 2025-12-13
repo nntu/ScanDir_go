@@ -20,20 +20,7 @@ import (
 	"github.com/xuri/excelize/v2"
 )
 
-// openDBSQLite opens a SQLite database with optimized settings
-func openDBSQLite(dbPath string) (*sql.DB, error) {
-	dsn := fmt.Sprintf("file:%s?_journal_mode=WAL&_synchronous=NORMAL", dbPath)
-
-	db, err := sql.Open("sqlite3", dsn)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := db.Exec("PRAGMA busy_timeout = 5000;"); err != nil {
-		return nil, err
-	}
-	db.SetMaxOpenConns(10)
-	return db, nil
-}
+// NOTE: openDBSQLite được dùng chung từ `common_db.go` (build tag reporter_optimized đã được bật).
 
 // configureDB configures database connection settings for optimal performance
 func configureDB(db *sql.DB, phase string, workers int) {
@@ -52,53 +39,53 @@ func configureDB(db *sql.DB, phase string, workers int) {
 
 // ReportConfigOptimized holds configuration for optimized report generation
 type ReportConfigOptimized struct {
-	DBFile          string
-	OutputPath      string
-	Format          string // "excel", "html", "console", "json"
-	TopN            int    // For top largest files
+	DBFile           string
+	OutputPath       string
+	Format           string // "excel", "html", "console", "json"
+	TopN             int    // For top largest files
 	MinDuplicateSize int64  // Minimum file size to consider for duplicates
-	EnableCache     bool   // Enable query result caching
-	Verbose         bool   // Enable verbose logging
+	EnableCache      bool   // Enable query result caching
+	Verbose          bool   // Enable verbose logging
 }
 
 // ReportMetrics holds performance metrics for report generation
 type ReportMetrics struct {
-	TotalFiles     int64         `json:"totalFiles"`
-	TotalSize      int64         `json:"totalSize"`
-	DuplicateFiles int64         `json:"duplicateFiles"`
-	DuplicateSize  int64         `json:"duplicateSize"`
-	GenerationTime time.Duration `json:"generationTime"`
-	QueriesExecuted int          `json:"queriesExecuted"`
-	CacheHits      int          `json:"cacheHits"`
+	TotalFiles      int64         `json:"totalFiles"`
+	TotalSize       int64         `json:"totalSize"`
+	DuplicateFiles  int64         `json:"duplicateFiles"`
+	DuplicateSize   int64         `json:"duplicateSize"`
+	GenerationTime  time.Duration `json:"generationTime"`
+	QueriesExecuted int           `json:"queriesExecuted"`
+	CacheHits       int           `json:"cacheHits"`
 }
 
 // ReportData holds all data needed for report generation
 type ReportData struct {
-	TopFiles     []FileInfoOptimized     `json:"topFiles"`
-	Duplicates   []DuplicateGroupOptimized `json:"duplicates"`
-	Summary      ReportSummary  `json:"summary"`
-	Metrics      ReportMetrics  `json:"metrics"`
-	GeneratedAt  time.Time      `json:"generatedAt"`
+	TopFiles    []FileInfoOptimized       `json:"topFiles"`
+	Duplicates  []DuplicateGroupOptimized `json:"duplicates"`
+	Summary     ReportSummary             `json:"summary"`
+	Metrics     ReportMetrics             `json:"metrics"`
+	GeneratedAt time.Time                 `json:"generatedAt"`
 }
 
 // FileInfo represents file information for reports
 type FileInfoOptimized struct {
-	ID       int64  `json:"id"`
-	Path     string `json:"path"`
-	Size     int64  `json:"size"`
-	Mtime    string `json:"mtime"`
-	Hash     string `json:"hash,omitempty"`
-	LoaiTM   string `json:"loaithumuc,omitempty"`
-	ThuMuc   string `json:"thumuc,omitempty"`
+	ID     int64  `json:"id"`
+	Path   string `json:"path"`
+	Size   int64  `json:"size"`
+	Mtime  string `json:"mtime"`
+	Hash   string `json:"hash,omitempty"`
+	LoaiTM string `json:"loaithumuc,omitempty"`
+	ThuMuc string `json:"thumuc,omitempty"`
 }
 
 // DuplicateGroupOptimized represents a group of duplicate files
 type DuplicateGroupOptimized struct {
-	Hash      string     `json:"hash"`
-	Size      int64      `json:"size"`
-	Count     int        `json:"count"`
+	Hash      string              `json:"hash"`
+	Size      int64               `json:"size"`
+	Count     int                 `json:"count"`
 	Files     []FileInfoOptimized `json:"files"`
-	TotalSize int64      `json:"totalSize"`
+	TotalSize int64               `json:"totalSize"`
 }
 
 // ReportSummary provides summary statistics
@@ -138,13 +125,13 @@ func (qc *QueryCache) Set(key string, value interface{}) {
 
 // OptimizedReporter generates reports with performance optimizations
 type OptimizedReporter struct {
-	logger    *logrus.Logger
-	db        *sql.DB
-	config    *ReportConfigOptimized
-	cache     *QueryCache
-	metrics   *ReportMetrics
-	ctx       context.Context
-	cancel    context.CancelFunc
+	logger  *logrus.Logger
+	db      *sql.DB
+	config  *ReportConfigOptimized
+	cache   *QueryCache
+	metrics *ReportMetrics
+	ctx     context.Context
+	cancel  context.CancelFunc
 }
 
 // NewOptimizedReporter creates a new optimized reporter
@@ -216,12 +203,12 @@ func (r *OptimizedReporter) generateReport() error {
 	r.metrics.GenerationTime = time.Since(startTime)
 
 	r.logger.WithFields(logrus.Fields{
-		"duration":         r.metrics.GenerationTime.Milliseconds(),
-		"totalFiles":       r.metrics.TotalFiles,
-		"duplicateFiles":   r.metrics.DuplicateFiles,
-		"duplicateSize":    r.metrics.DuplicateSize,
-		"queriesExecuted":  r.metrics.QueriesExecuted,
-		"cacheHits":        r.metrics.CacheHits,
+		"duration":        r.metrics.GenerationTime.Milliseconds(),
+		"totalFiles":      r.metrics.TotalFiles,
+		"duplicateFiles":  r.metrics.DuplicateFiles,
+		"duplicateSize":   r.metrics.DuplicateSize,
+		"queriesExecuted": r.metrics.QueriesExecuted,
+		"cacheHits":       r.metrics.CacheHits,
 	}).Info("Report generation completed successfully")
 
 	return nil
@@ -482,9 +469,9 @@ func (r *OptimizedReporter) generateExcelReport(data *ReportData) error {
 
 	// Create sheets
 	sheets := map[string]string{
-		"Summary":        "Summary",
-		"Top Files":      "Top_Largest_Files",
-		"Duplicates":     "Duplicate_Files",
+		"Summary":    "Summary",
+		"Top Files":  "Top_Largest_Files",
+		"Duplicates": "Duplicate_Files",
 	}
 
 	for sheetName, sheetTitle := range sheets {
@@ -845,21 +832,26 @@ func configureDBReport(db *sql.DB) {
 	db.Exec("PRAGMA cache_size = -128000") // 128MB cache for reporting
 	db.Exec("PRAGMA temp_store = MEMORY")
 	db.Exec("PRAGMA mmap_size = 536870912") // 512MB memory map
-	db.Exec("PRAGMA query_only = 1") // Read-only for reporting
+	db.Exec("PRAGMA query_only = 1")        // Read-only for reporting
 }
 
 // Main function for optimized reporter
 func main() {
 	// Use the existing main functionality but with optimized reporting
-	config := &ReportConfigOptimized{
-		DBFile:           *flag.String("dbfile", "", "Database file path"),
-		OutputPath:       *flag.String("output", "", "Output file path"),
-		Format:          *flag.String("format", "excel", "Report format (excel, html, console, json)"),
-		TopN:            *flag.Int("topn", 100, "Number of top largest files to include"),
-		MinDuplicateSize: *flag.Int64("minsize", 1024, "Minimum file size for duplicates"),
-	}
-
+	dbFile := flag.String("dbfile", "", "Database file path")
+	outputPath := flag.String("output", "", "Output file path")
+	format := flag.String("format", "excel", "Report format (excel, html, console, json)")
+	topN := flag.Int("topn", 100, "Number of top largest files to include")
+	minSize := flag.Int64("minsize", 1024, "Minimum file size for duplicates")
 	flag.Parse()
+
+	config := &ReportConfigOptimized{
+		DBFile:           *dbFile,
+		OutputPath:       *outputPath,
+		Format:           *format,
+		TopN:             *topN,
+		MinDuplicateSize: *minSize,
+	}
 
 	if config.DBFile == "" {
 		fmt.Fprintln(os.Stderr, "Error: Database file path required")
