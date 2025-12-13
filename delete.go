@@ -4,13 +4,16 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"encoding/csv"
 	"database/sql"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,6 +24,52 @@ import (
 type deleteFilter struct {
 	SizeZero bool
 	Exts     []string // normalized, e.g. ".tmp"
+}
+
+type listWriter struct {
+	f *os.File
+	bw *bufio.Writer
+	cw *csv.Writer
+}
+
+func openListWriter(path string, format string) (*listWriter, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, nil
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		return nil, err
+	}
+
+	bw := bufio.NewWriterSize(f, 1024*1024)
+	cw := csv.NewWriter(bw)
+	switch strings.ToLower(strings.TrimSpace(format)) {
+	case "", "csv":
+		cw.Comma = ','
+	case "tsv":
+		cw.Comma = '\t'
+	default:
+		_ = f.Close()
+		return nil, fmt.Errorf("unsupported list format %q (use csv|tsv)", format)
+	}
+
+	return &listWriter{f: f, bw: bw, cw: cw}, nil
+}
+
+func (lw *listWriter) Close() error {
+	if lw == nil {
+		return nil
+	}
+	lw.cw.Flush()
+	_ = lw.bw.Flush()
+	return lw.f.Close()
+}
+
+func (lw *listWriter) WriteRecord(fields ...string) {
+	if lw == nil {
+		return
+	}
+	_ = lw.cw.Write(fields)
 }
 
 // configureDB configures database connection settings for optimal performance
@@ -136,7 +185,7 @@ func buildInPlaceholders(n int) string {
 	return strings.TrimRight(strings.Repeat("?,", n), ",")
 }
 
-func deleteByConditions(ctx context.Context, db *sql.DB, logger *logrus.Logger, basePath string, filter deleteFilter, deleteDisk bool, dryRun bool, limit int) (int64, int64, int64, error) {
+func deleteByConditions(ctx context.Context, db *sql.DB, logger *logrus.Logger, basePath string, filter deleteFilter, deleteDisk bool, dryRun bool, limit int, out *listWriter) (int64, int64, int64, error) {
 	// returns: dbDeleted, diskDeleted, errors
 	var dbDeleted int64
 	var diskDeleted int64
@@ -257,6 +306,7 @@ func deleteByConditions(ctx context.Context, db *sql.DB, logger *logrus.Logger, 
 			logger.WithError(err).Warn("Failed to scan fs_files row")
 			continue
 		}
+		out.WriteRecord("file", strconv.FormatInt(id, 10), p)
 		batch = append(batch, idPath{id: id, path: p})
 		if len(batch) >= commitBatch {
 			if err := flush(); err != nil {
@@ -272,6 +322,58 @@ func deleteByConditions(ctx context.Context, db *sql.DB, logger *logrus.Logger, 
 	}
 
 	return dbDeleted, diskDeleted, errCount, nil
+}
+
+func exportPathModeList(ctx context.Context, db *sql.DB, scopePath string, out *listWriter) (int64, int64, error) {
+	if out == nil {
+		return 0, 0, nil
+	}
+	likePath := scopePath
+	if !strings.HasSuffix(likePath, "/") {
+		likePath += "/"
+	}
+	likePath += "%"
+
+	// folders
+	var folders int64
+	rowsF, err := db.QueryContext(ctx, `SELECT id, path FROM fs_folders WHERE path = ? OR path LIKE ? ORDER BY id`, scopePath, likePath)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer rowsF.Close()
+	for rowsF.Next() {
+		var id int64
+		var p string
+		if err := rowsF.Scan(&id, &p); err != nil {
+			return 0, 0, err
+		}
+		out.WriteRecord("folder", strconv.FormatInt(id, 10), p)
+		folders++
+	}
+	if err := rowsF.Err(); err != nil {
+		return 0, 0, err
+	}
+
+	// files
+	var files int64
+	rows, err := db.QueryContext(ctx, `SELECT id, path FROM fs_files WHERE path = ? OR dir_path = ? OR dir_path LIKE ? OR path LIKE ? ORDER BY id`, scopePath, scopePath, likePath, likePath)
+	if err != nil {
+		return folders, 0, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		var p string
+		if err := rows.Scan(&id, &p); err != nil {
+			return folders, files, err
+		}
+		out.WriteRecord("file", strconv.FormatInt(id, 10), p)
+		files++
+	}
+	if err := rows.Err(); err != nil {
+		return folders, files, err
+	}
+	return folders, files, nil
 }
 
 // ----------------------------
@@ -299,6 +401,10 @@ func main() {
 	filterSizeZero := flag.Bool("size-zero", false, "Filter: only files with size = 0")
 	filterExts := flag.String("ext", "", "Filter: file extensions, comma-separated (e.g. .tmp,.log,.bak)")
 	limit := flag.Int("limit", 0, "Safety: max number of files to delete (0 = no limit)")
+
+	// Export list
+	listOut := flag.String("list-out", "", "Write list of items that match deletion scope/filters to this file")
+	listFormat := flag.String("list-format", "csv", "List output format: csv or tsv")
 	flag.Parse()
 
 	if *dbFile == "" {
@@ -330,6 +436,20 @@ func main() {
 	}
 	useFilter := filter.SizeZero || len(filter.Exts) > 0
 
+	out, err := openListWriter(*listOut, *listFormat)
+	if err != nil {
+		logger.WithError(err).Fatal("Failed to open -list-out")
+	}
+	defer func() {
+		if cerr := out.Close(); cerr != nil {
+			logger.WithError(cerr).Warn("Failed to close -list-out writer")
+		}
+	}()
+	// Header row for CSV/TSV
+	if out != nil {
+		out.WriteRecord("type", "id", "path")
+	}
+
 	logger.WithFields(logrus.Fields{
 		"dbPath":     *dbFile,
 		"scopePath":  cleanPath,
@@ -339,6 +459,8 @@ func main() {
 		"sizeZero":   filter.SizeZero,
 		"extFilters": filter.Exts,
 		"limit":      *limit,
+		"listOut":    *listOut,
+		"listFormat": *listFormat,
 	}).Info("Starting deletion job")
 
 	// Open database with optimized settings
@@ -357,7 +479,7 @@ func main() {
 	// FILTER MODE: delete by conditions within scopePath
 	if useFilter {
 		startTime := time.Now()
-		dbDeleted, diskDeleted, errCount, err := deleteByConditions(ctx, db, logger, cleanPath, filter, *deleteDisk, *dryRun, *limit)
+		dbDeleted, diskDeleted, errCount, err := deleteByConditions(ctx, db, logger, cleanPath, filter, *deleteDisk, *dryRun, *limit, out)
 		if err != nil {
 			logger.WithError(err).Fatal("Filter deletion failed")
 		}
@@ -370,6 +492,13 @@ func main() {
 			"itemsPerSec": float64(dbDeleted) / duration.Seconds(),
 		}).Info("Filter deletion completed")
 		return
+	}
+
+	// PATH MODE: export list before delete/dry-run (optional)
+	if out != nil {
+		if _, _, err := exportPathModeList(ctx, db, cleanPath, out); err != nil {
+			logger.WithError(err).Fatal("Failed to export list for path mode")
+		}
 	}
 
 	// Check if path exists in database before deletion (for dry run)

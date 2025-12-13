@@ -1,6 +1,6 @@
-# Filesystem Indexer (SQLite Edition)
+# Công cụ Duyệt Hệ thống File (Phiên bản SQLite)
 
-Dự án này là một tool Go hiệu suất cao dùng để quét (scan) các hệ thống file lớn, tính toán hash (MD5) của từng file, và lưu trữ kết quả vào một file database **SQLite** duy nhất cho mỗi lần chạy.
+Đây là một công cụ Go hiệu suất cao dùng để quét các hệ thống file lớn, tính toán hash (MD5) của từng file, và lưu trữ kết quả vào một file database **SQLite** duy nhất cho mỗi lần chạy.
 
 Mục tiêu chính là tạo ra một cơ sở dữ liệu "snapshot" (ảnh chụp nhanh) của hệ thống file để phục vụ cho việc **phân tích file trùng lặp** và **tạo báo cáo dung lượng**.
 
@@ -13,90 +13,138 @@ Kiến trúc này được tối ưu cho tốc độ quét, loại bỏ hoàn to
 * **Tối ưu Hashing**: Tự động tính toán MD5 cho các file có nội dung (size > 0).
 * **Tối ưu Ghi**: Sử dụng `WAL mode`, `PRAGMA` tối ưu, và `Batch Inserts` bên trong `Transaction` để đạt tốc độ ghi SQLite nhanh nhất.
 * **Đơn giản hóa**: Loại bỏ hoàn toàn logic theo dõi thay đổi (`deleted_at`), chỉ tập trung vào việc tạo snapshot.
+* **Kiểm tra trùng lặp có thể chạy lại**: Có tool `checkdup` để rebuild `duplicate_groups` + `is_duplicate` và theo dõi tiến độ trong `duplicate_runs`.
+* **Báo cáo nâng cao**: Có `reporter_opt` (build tag `reporter_optimized`) để report nhanh hơn (cache + query tối ưu).
 
-## How it Works
+## Nguyên lý hoạt động
 
-The application operates in two distinct phases:
+Ứng dụng hoạt động qua hai giai đoạn riêng biệt:
 
-1.  **Phase 1: Metadata Scan:**
-    *   Recursively scans the root paths defined in `config.ini`.
-    *   Collects file metadata (name, path, size, modification time) for all files.
-    *   Inserts this metadata into the SQLite database in batches for high performance.
+1.  **Giai đoạn 1: Quét Metadata:**
+    *   Quét đệ quy các đường dẫn gốc được định nghĩa trong `config.ini`.
+    *   Thu thập metadata của file (tên, đường dẫn, kích thước, thời gian sửa đổi) cho tất cả các file.
+    *   Chèn metadata này vào database SQLite theo lô để đạt hiệu suất cao.
 
-2.  **Phase 2: Hashing:**
-    *   Queries the database to find files with identical sizes, as these are potential duplicates.
-    *   For these potential duplicates, it calculates the MD5 hash of each file.
-    *   Updates the database with the calculated hashes.
+2.  **Giai đoạn 2: Băm (Hashing):**
+    *   Truy vấn database để tìm các file có kích thước giống hệt nhau, vì đây là các file có khả năng trùng lặp.
+    *   Đối với các file trùng lặp tiềm năng này, nó tính toán hash MD5 của từng file.
+    *   Cập nhật database với các hash đã tính toán.
 
-## Configuration
+## Cấu hình
 
-The application is configured via the `config.ini` file:
+Ứng dụng được cấu hình qua file `config.ini`:
 
 *   `[output]`:
-    *   `output_dir`: The directory where the resulting SQLite database files will be saved.
+    *   `output_dir`: Thư mục mà các file database SQLite kết quả sẽ được lưu.
 *   `[scan]`:
-    *   `BATCH_SIZE`: The number of file records to batch together for a single database insert.
-    *   `MAX_WORKERS`: The number of concurrent workers for scanning directories.
-    *   `EXCLUDE_DIRS`: A comma-separated list of directory names to exclude from the scan.
+    *   `BATCH_SIZE`: Số lượng bản ghi file được nhóm lại để chèn vào database một lần.
+    *   `MAX_WORKERS`: Số lượng worker song song để quét thư mục.
+    *   `EXCLUDE_DIRS`: Danh sách các tên thư mục bị loại trừ khỏi việc quét, ngăn cách bởi dấu phẩy.
 *   `[paths]`:
-    *   `root1`, `root2`, etc.: The root paths to be scanned. The format is `key = /path/to/folder:TagName`.
+    *   `root1`, `root2`, v.v.: Các đường dẫn gốc cần quét. Định dạng là `key = /path/to/folder:TagName`.
 
-## Usage
+## Sử dụng
 
-This project provides three main executables: `scanner`, `deleter`, and `reporter`.
+Dự án này cung cấp các chương trình thực thi (Go build tags):
 
-1.  **Configure:** Edit the `config.ini` file to specify the paths you want to scan.
+- `scanner` (tag `scanner`): quét metadata + hashing duplicate (Giai đoạn 1/2)
+- `checkdup` (tag `checkdup`): rebuild duplicate data (có thể chạy lại, có progress)
+- `deleter` (tag `deleter`): xoá record trong DB theo đường dẫn hoặc theo điều kiện (tuỳ chọn xoá file thật)
+- `reporter` (tag `reporter`): report cơ bản
+- `reporter_opt` (tag `reporter_optimized`): report tối ưu
 
-2.  **Build and Extract Binaries (using Makefile):**
-    To build all executables (`scanner`, `deleter`, `reporter`) and extract them to your current directory, use the provided `Makefile`:
+1.  **Cấu hình:** Chỉnh sửa file `config.ini` để chỉ định các đường dẫn bạn muốn quét.
+
+2.  **Build binaries cục bộ (Makefile):**
+    Để build các chương trình thực thi cục bộ, sử dụng:
     ```bash
-    make
+    make build-local
     ```
-    This will create `scanner`, `deleter`, and `reporter` binaries in your project root.
+    Điều này sẽ tạo ra `scanner`, `checkdup`, `deleter`, `reporter`, `reporter_opt` trong thư mục gốc của dự án (tuỳ thuộc vào HĐH/CGO).
 
-3.  **Run Scanner:**
-    Execute the `scanner` application from the command line. This will scan the configured paths and create a SQLite database.
+    **Lưu ý Windows + SQLite**: dự án dùng `github.com/mattn/go-sqlite3` nên cần **CGO**. Nếu bạn build mà bị lỗi kiểu `CGO_ENABLED=0 ... sqlite3 requires cgo`, hãy build bằng Docker (phần dưới) hoặc cài GCC (MSYS2/mingw) và build với `CGO_ENABLED=1`.
+
+3.  **Chạy Scanner:**
+    Thực thi chương trình `scanner` từ dòng lệnh. Điều này sẽ quét các đường dẫn đã cấu hình và tạo một database SQLite.
     ```bash
     ./scanner
     ```
 
-4.  **Run Deleter:**
-    Use the `deleter` to remove entries from the database. **Note: This tool does NOT delete files from the actual filesystem.**
+4.  **Chạy Deleter:**
+    Sử dụng `deleter` để xoá dữ liệu.
+
+    - **Chế độ Path (mặc định)**: xoá record trong DB theo phạm vi thư mục/file.
     ```bash
     ./deleter -dbfile <path_to_scan.db> -path <absolute_path_to_delete>
     ```
-    Example:
+    Ví dụ:
     ```bash
     ./deleter -dbfile ./output_scans/scan_20251024_130000.db -path /path/to/folder/or/file
     ```
 
-5.  **Run Reporter:**
-    Generate reports (top largest files, duplicate files) in various formats.
+    - **Chế độ Filter**: xoá theo điều kiện trong phạm vi `-path`:
+        - `-size-zero`: chỉ file `size=0`
+        - `-ext ".tmp,.bak"`: lọc theo `fileExt`
+        - `-limit N`: giới hạn số lượng để an toàn
+        - `-delete-disk`: **xoá file thật trên ổ đĩa** (NGUY HIỂM) + xoá record DB tương ứng
+
+    - **Xuất danh sách xoá (CSV/TSV)**:
+        - `-list-out <file>`: xuất danh sách `type,id,path`
+        - `-list-format csv|tsv` (mặc định `csv`)
+
+    Ví dụ (dry-run + xuất CSV):
+    ```bash
+    ./deleter -dbfile ./output_scans/scan_20251024_130000.db -path /path/to/scope -ext ".tmp" -dry-run -list-out delete_list.csv
+    ```
+
+5.  **Chạy Reporter:**
+    Tạo báo cáo (các file lớn nhất, file trùng lặp) ở nhiều định dạng khác nhau.
     ```bash
     ./reporter -dbfile <path_to_scan.db> -format <excel|html|console> [-output <output_file>] [-topn <number>]
     ```
-    Examples:
-    *   Generate console report (default):
+    Ví dụ:
+    *   Tạo báo cáo console (mặc định):
         ```bash
         ./reporter -dbfile ./output_scans/scan_20251024_130000.db
         ```
-    *   Generate Excel report:
+    *   Tạo báo cáo Excel:
         ```bash
         ./reporter -dbfile ./output_scans/scan_20251024_130000.db -format excel -output my_report.xlsx
         ```
-    *   Generate HTML report with top 50 files:
+    *   Tạo báo cáo HTML với 50 file lớn nhất:
         ```bash
         ./reporter -dbfile ./output_scans/scan_20251024_130000.db -format html -output my_report.html -topn 50
         ```
 
-6.  **Analyze:** Once the scan is complete, a new SQLite database file will be created in the `output_dir`. You can use any SQLite client (like DBeaver, DB Browser for SQLite) to open the file and analyze the data.
+    *   Reporter tối ưu:
+        ```bash
+        ./reporter_opt -dbfile ./output_scans/scan_20251024_130000.db -format json -output report.json
+        ```
 
-## Cross-compiling for Linux (with Docker)
+6. **Chạy CheckDup (chạy lại phát hiện trùng lặp):**
 
-If you need to run the `scanner`, `deleter`, and `reporter` on a Linux system, you can use Docker to cross-compile the application. This ensures that the binaries are built in a consistent environment.
+```bash
+./checkdup -dbfile ./output_scans/scan_20251024_130000.db -reset=true
+```
 
-1.  **Ensure `Dockerfile` is present:**
-    Make sure the `Dockerfile` in the root of your project directory has the following content:
+Tool sẽ rebuild `duplicate_groups` + cập nhật `is_duplicate`. Tiến độ được ghi vào bảng `duplicate_runs` trong DB.
+
+7.  **Phân tích:** Khi việc quét hoàn tất, một file database SQLite mới sẽ được tạo trong `output_dir`. Bạn có thể sử dụng bất kỳ client SQLite nào (như DBeaver, DB Browser for SQLite) để mở file và phân tích dữ liệu.
+
+## Mẹo phát triển: chạy đúng với Go build tags
+
+Nếu bạn dùng `go run`, hãy chạy trên **package** và chỉ định tag, ví dụ:
+
+```bash
+go run -tags reporter . -dbfile ./output_scans/scan_20251024_130000.db -format console
+```
+
+## Cross-compiling cho Linux (với Docker)
+
+Nếu bạn cần chạy `scanner`, `deleter`, và `reporter` trên hệ thống Linux, bạn có thể sử dụng Docker để cross-compile ứng dụng. Điều này đảm bảo rằng các binary được xây dựng trong một môi trường nhất quán.
+
+1.  **Đảm bảo `Dockerfile` có mặt:**
+    Đảm bảo rằng `Dockerfile` trong thư mục gốc của dự án của bạn có nội dung sau:
 
     ```dockerfile
     # ===== Stage 1: Builder (glibc 2.17 baseline)
@@ -137,11 +185,19 @@ If you need to run the `scanner`, `deleter`, and `reporter` on a Linux system, y
     COPY --from=builder /out/reporter /reporter
     ```
 
-2.  **Build and Extract Binaries (using Makefile):**
-    Use the provided `Makefile` to build the Docker image and extract all binaries (`scanner`, `deleter`, `reporter`) to your current directory:
+2.  **Build và Extract Binaries (sử dụng Makefile):**
+    Sử dụng `Makefile` được cung cấp để build Docker image và extract binaries:
     ```bash
     make
     ```
-    This command will handle building the Docker image and copying the executables out of the container.
+    Lệnh này sẽ xử lý việc build Docker image và sao chép các chương trình thực thi ra khỏi container.
 
-After these steps, you will find the `scanner`, `deleter`, and `reporter` executables in your project directory, ready to be transferred and run on your target Linux system.
+Sau các bước này, bạn sẽ tìm thấy các chương trình thực thi trong thư mục dự án của mình, sẵn sàng để chuyển và chạy trên hệ thống Linux mục tiêu.
+
+## Build cho QNAP (Dockerfile.qnap)
+
+Repo có `Dockerfile.qnap` để build ra:
+- `./qnap-build/bin/{scanner,deleter,reporter,reporter_opt,checkdup}`
+- `./qnap-build/qnap-scandir-<VERSION>-<arch>.tar.gz`
+
+Lưu ý: `.dockerignore` đã exclude `output_dir/` để tránh đưa DB lớn vào Docker build context.
