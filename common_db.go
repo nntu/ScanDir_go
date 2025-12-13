@@ -12,6 +12,80 @@ import (
 	_ "github.com/mattn/go-sqlite3" // Import driver SQLite
 )
 
+// ensureSchemaUpgrades: apply non-destructive schema upgrades for older DB files.
+// Safe to call multiple times.
+func ensureSchemaUpgrades(db *sql.DB) error {
+	// If fs_folders doesn't exist, nothing to do.
+	var dummy int
+	err := db.QueryRow(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='fs_folders' LIMIT 1;`).Scan(&dummy)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("check sqlite_master(fs_folders): %w", err)
+	}
+
+	cols := map[string]bool{}
+	rows, err := db.Query(`PRAGMA table_info(fs_folders);`)
+	if err != nil {
+		return fmt.Errorf("PRAGMA table_info(fs_folders): %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull int
+		var dflt sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return fmt.Errorf("scan PRAGMA table_info(fs_folders): %w", err)
+		}
+		cols[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate PRAGMA table_info(fs_folders): %w", err)
+	}
+
+	// Add folder stats columns if missing (non-destructive).
+	if !cols["size"] {
+		if _, err := db.Exec(`ALTER TABLE fs_folders ADD COLUMN size BIGINT NOT NULL DEFAULT 0;`); err != nil {
+			return fmt.Errorf("ALTER TABLE fs_folders ADD COLUMN size: %w", err)
+		}
+	}
+	if !cols["number_files"] {
+		if _, err := db.Exec(`ALTER TABLE fs_folders ADD COLUMN number_files INTEGER NOT NULL DEFAULT 0;`); err != nil {
+			return fmt.Errorf("ALTER TABLE fs_folders ADD COLUMN number_files: %w", err)
+		}
+	}
+	if !cols["subtree_size"] {
+		if _, err := db.Exec(`ALTER TABLE fs_folders ADD COLUMN subtree_size BIGINT NOT NULL DEFAULT 0;`); err != nil {
+			return fmt.Errorf("ALTER TABLE fs_folders ADD COLUMN subtree_size: %w", err)
+		}
+	}
+	if !cols["subtree_files"] {
+		if _, err := db.Exec(`ALTER TABLE fs_folders ADD COLUMN subtree_files INTEGER NOT NULL DEFAULT 0;`); err != nil {
+			return fmt.Errorf("ALTER TABLE fs_folders ADD COLUMN subtree_files: %w", err)
+		}
+	}
+
+	// Helpful indexes (no-op if already exists).
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_folder_size ON fs_folders (size DESC);`); err != nil {
+		return fmt.Errorf("CREATE INDEX idx_folder_size: %w", err)
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_folder_number_files ON fs_folders (number_files DESC);`); err != nil {
+		return fmt.Errorf("CREATE INDEX idx_folder_number_files: %w", err)
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_folder_subtree_size ON fs_folders (subtree_size DESC);`); err != nil {
+		return fmt.Errorf("CREATE INDEX idx_folder_subtree_size: %w", err)
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_folder_subtree_files ON fs_folders (subtree_files DESC);`); err != nil {
+		return fmt.Errorf("CREATE INDEX idx_folder_subtree_files: %w", err)
+	}
+
+	return nil
+}
+
 // makeDBSQLite (dùng cho scanner)
 func makeDBSQLite(dbPath string) (*sql.DB, error) {
 	_ = os.Remove(dbPath) // Xóa file cũ nếu tồn tại
@@ -23,6 +97,9 @@ func makeDBSQLite(dbPath string) (*sql.DB, error) {
 		return nil, err
 	}
 	if _, err := db.Exec("PRAGMA busy_timeout = 5000;"); err != nil {
+		return nil, err
+	}
+	if err := ensureSchemaUpgrades(db); err != nil {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1) // Ghi đơn luồng trong Phase 1
@@ -40,6 +117,9 @@ func openDBSQLite(dbPath string) (*sql.DB, error) {
 	if _, err := db.Exec("PRAGMA busy_timeout = 5000;"); err != nil {
 		return nil, err
 	}
+	if err := ensureSchemaUpgrades(db); err != nil {
+		return nil, err
+	}
 	db.SetMaxOpenConns(10)
 	return db, nil
 }
@@ -55,6 +135,10 @@ func initDDL(ctx context.Context, db *sql.DB) error {
 		  name TEXT NOT NULL,
 		  st_mtime DATETIME NOT NULL,
 		  loaithumuc TEXT,
+		  size BIGINT NOT NULL DEFAULT 0,
+		  number_files INTEGER NOT NULL DEFAULT 0,
+		  subtree_size BIGINT NOT NULL DEFAULT 0,
+		  subtree_files INTEGER NOT NULL DEFAULT 0,
 
 		  FOREIGN KEY (parent_id) REFERENCES fs_folders (id)
 		)`,
@@ -62,6 +146,10 @@ func initDDL(ctx context.Context, db *sql.DB) error {
 		`CREATE INDEX idx_folder_parent_id ON fs_folders (parent_id);`,
 		`CREATE INDEX idx_folder_mtime ON fs_folders (st_mtime DESC);`,
 		`CREATE INDEX idx_folder_loaithumuc ON fs_folders (loaithumuc);`,
+		`CREATE INDEX idx_folder_size ON fs_folders (size DESC);`,
+		`CREATE INDEX idx_folder_number_files ON fs_folders (number_files DESC);`,
+		`CREATE INDEX idx_folder_subtree_size ON fs_folders (subtree_size DESC);`,
+		`CREATE INDEX idx_folder_subtree_files ON fs_folders (subtree_files DESC);`,
 
 		// Bảng Files
 		`CREATE TABLE fs_files (
